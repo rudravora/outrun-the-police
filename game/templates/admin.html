@@ -1,0 +1,233 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Outrun the Police — Admin</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #111; color: #eee; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 0 0 8px; color: #aaa; text-transform: uppercase; letter-spacing: .05em; }
+  section { background: #1b1b1b; border: 1px solid #333; border-radius: 6px; padding: 14px; margin-bottom: 16px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  input, button, select { font: inherit; padding: 6px 10px; border-radius: 4px; border: 1px solid #444; background: #222; color: #eee; }
+  button { cursor: pointer; }
+  button.primary { background: #2a6f2a; border-color: #3a8f3a; font-weight: 600; }
+  button.primary:hover { background: #338033; }
+  button.secondary { background: #222; opacity: .7; font-size: 12px; }
+  button.danger { background: #7a2a2a; border-color: #9a3a3a; }
+  #clock-value { font-size: 28px; font-weight: 700; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border-bottom: 1px solid #333; padding: 4px 8px; text-align: left; }
+  th { color: #999; font-weight: 600; }
+  .ok { color: #6f6; }
+  .bad { color: #f66; }
+  .node-chip { display: inline-block; padding: 3px 8px; margin: 2px; border-radius: 4px; border: 1px solid #444; cursor: pointer; font-size: 12px; }
+  .node-chip.compromised { background: #7a2a2a; border-color: #9a3a3a; }
+  #login { max-width: 360px; margin: 80px auto; }
+  #app { display: none; max-width: 1000px; margin: 0 auto; }
+  .muted { color: #888; font-size: 12px; }
+  .hint { font-size: 12px; color: #999; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <h1>Outrun the Police — Admin</h1>
+  <div class="row">
+    <input id="token-input" type="password" placeholder="Admin token" style="flex:1">
+    <button class="primary" onclick="login()">Enter</button>
+  </div>
+  <div id="login-error" class="bad"></div>
+</div>
+
+<div id="app">
+  <h1>Outrun the Police — Admin Panel</h1>
+  <p class="muted">Token-protected. Separate from the team-facing app.</p>
+
+  <section>
+    <h2>Event Clock</h2>
+    <div id="clock-value">t = ? min</div>
+    <div class="row">
+      <input id="set-t" type="number" step="0.1" placeholder="minute">
+      <button class="primary" onclick="setClock()">Set clock to this minute</button>
+    </div>
+    <div class="hint">
+      This is the primary way to run the event clock — jump to a specific
+      minute on organizer cues. Start/Pause below free-run the clock in
+      real time and are for testing only; do not rely on them during the
+      live event.
+    </div>
+    <div class="row">
+      <button class="secondary" onclick="clockAction('start')">Start (testing only)</button>
+      <button class="secondary" onclick="clockAction('pause')">Pause (testing only)</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Compromised Nodes</h2>
+    <p class="hint">Click a node to toggle compromised. Takes effect immediately on the next submission — no reload needed.</p>
+    <div id="node-grid"></div>
+  </section>
+
+  <section>
+    <h2>Leaderboard</h2>
+    <button class="secondary" onclick="loadLeaderboard()">Refresh</button>
+    <table id="leaderboard-table">
+      <thead><tr><th>Team</th><th>Best score</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Live Submissions</h2>
+    <div class="row">
+      <label><input type="checkbox" id="auto-refresh" checked onchange="toggleAutoRefresh()"> Auto-refresh (5s)</label>
+      <button class="secondary" onclick="loadSubmissions()">Refresh now</button>
+    </div>
+    <table id="submissions-table">
+      <thead><tr><th>Team</th><th>Valid</th><th>Reason / Score</th><th>Route</th><th>Event t</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Export Final Results</h2>
+    <p class="hint">Best valid route per team — the artifact Game 5 needs.</p>
+    <div class="row">
+      <button class="primary" onclick="exportResults('json')">Export JSON</button>
+      <button class="primary" onclick="exportResults('csv')">Export CSV</button>
+    </div>
+  </section>
+</div>
+
+<script>
+let TOKEN = null;
+let autoRefreshTimer = null;
+
+function login() {
+  TOKEN = document.getElementById('token-input').value;
+  fetch('/api/leaderboard', { headers: { 'X-Admin-Token': TOKEN } })
+    .then(r => {
+      if (!r.ok) throw new Error('bad token');
+      document.getElementById('login').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      initApp();
+    })
+    .catch(() => {
+      document.getElementById('login-error').textContent = 'Invalid token.';
+    });
+}
+
+function authedFetch(url, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers, { 'X-Admin-Token': TOKEN });
+  return fetch(url, opts);
+}
+
+function initApp() {
+  loadClock();
+  loadGraphForNodes();
+  loadLeaderboard();
+  loadSubmissions();
+  toggleAutoRefresh();
+}
+
+function loadClock() {
+  fetch('/api/graph').then(r => r.json()).then(g => {
+    document.getElementById('clock-value').textContent = 't = ' + g.event_time.toFixed(2) + ' min';
+  });
+}
+
+function setClock() {
+  const t = parseFloat(document.getElementById('set-t').value);
+  if (isNaN(t)) return;
+  authedFetch('/api/admin/clock', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'set', t: t })
+  }).then(r => r.json()).then(() => {
+    loadClock();
+    loadGraphForNodes();
+  });
+}
+
+function clockAction(action) {
+  authedFetch('/api/admin/clock', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: action })
+  }).then(r => r.json()).then(() => loadClock());
+}
+
+function loadGraphForNodes() {
+  fetch('/api/graph').then(r => r.json()).then(g => {
+    const grid = document.getElementById('node-grid');
+    grid.innerHTML = '';
+    g.nodes.forEach(n => {
+      const chip = document.createElement('span');
+      chip.className = 'node-chip' + (n.compromised ? ' compromised' : '');
+      chip.textContent = n.id;
+      chip.onclick = () => toggleNode(n.id, !n.compromised);
+      grid.appendChild(chip);
+    });
+  });
+}
+
+function toggleNode(nodeId, compromised) {
+  authedFetch('/api/admin/compromise', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ node_id: nodeId, compromised: compromised })
+  }).then(r => r.json()).then(() => loadGraphForNodes());
+}
+
+function loadLeaderboard() {
+  authedFetch('/api/leaderboard').then(r => r.json()).then(rows => {
+    const tbody = document.querySelector('#leaderboard-table tbody');
+    tbody.innerHTML = '';
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${row.team_code}</td><td>${row.best_score.toFixed(1)}</td>`;
+      tbody.appendChild(tr);
+    });
+  });
+}
+
+function loadSubmissions() {
+  authedFetch('/api/admin/submissions').then(r => r.json()).then(rows => {
+    const tbody = document.querySelector('#submissions-table tbody');
+    tbody.innerHTML = '';
+    rows.forEach(row => {
+      const tr = document.createElement('tr');
+      const validCell = row.valid ? '<span class="ok">accepted</span>' : '<span class="bad">rejected</span>';
+      const detail = row.valid ? 'score ' + row.score.toFixed(1) : row.reason;
+      const route = JSON.parse(row.route_json).join(' → ');
+      tr.innerHTML = `<td>${row.team_code}</td><td>${validCell}</td><td>${detail}</td><td class="muted">${route}</td><td>${row.event_t.toFixed(2)}</td>`;
+      tbody.appendChild(tr);
+    });
+  });
+}
+
+function toggleAutoRefresh() {
+  clearInterval(autoRefreshTimer);
+  if (document.getElementById('auto-refresh').checked) {
+    autoRefreshTimer = setInterval(() => {
+      loadSubmissions();
+      loadLeaderboard();
+      loadClock();
+    }, 5000);
+  }
+}
+
+function exportResults(fmt) {
+  const url = fmt === 'csv' ? '/api/admin/export.csv' : '/api/admin/export';
+  authedFetch(url).then(r => r.blob()).then(blob => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'results.' + fmt;
+    a.click();
+  });
+}
+</script>
+</body>
+</html>
