@@ -6,4 +6,4 @@ set -e
 mkdir -p /data
 ln -sfn /data/game.db game/game.db
 
-exec gunicorn --chdir game app:app
+exec gunicorn --chdir game --bind 0.0.0.0:${PORT:-8000} app:app
