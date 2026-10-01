@@ -3,11 +3,17 @@ SQLite persistence for "Outrun the Police". One shared DB file so state
 (teams, submissions, compromised nodes, event clock) survives a server
 restart — see claude.md ground rules.
 """
+import os
 import sqlite3
 import time
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "game.db"
+# Overridable so a host with a persistent disk (e.g. a Render disk mounted
+# at /data, or a Railway volume) can point this at storage that survives a
+# redeploy — plain app storage on most free-tier hosts does NOT survive
+# one, which would silently reset teams/submissions. Defaults to the old
+# in-repo path for local dev, unchanged.
+DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "game.db")))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS teams (

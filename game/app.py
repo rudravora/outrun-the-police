@@ -578,10 +578,22 @@ def integration_compromise_trigger():
     return jsonify({"team_code": team_code, "node_id": node_id, "compromised": True})
 
 
-if __name__ == "__main__":
-    db.init_db()
-    # Flask's debug reloader spawns a parent + child process; only start the
-    # outbox-drain thread in the actual worker (avoids running it twice).
-    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+# Runs at import time too (not just under `python app.py`), so this also
+# fires correctly under a production WSGI server (gunicorn imports this
+# module and never executes the __main__ block below).
+db.init_db()
+if os.environ.get("WERKZEUG_RUN_MAIN") != "false":
+    # Under Flask's debug reloader, the parent process re-execs with
+    # WERKZEUG_RUN_MAIN unset and the child sets it to "true" — only the
+    # actual worker (child, or gunicorn's single import) starts the thread,
+    # never the reloader's parent, so it's never started twice.
+    if os.environ.get("FLASK_DEBUG") != "1" or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         gateway_client.start_drain_thread()
-    app.run(debug=True, port=5050)
+
+if __name__ == "__main__":
+    # Local dev entrypoint. Production (Render/Railway) runs this module
+    # under gunicorn instead — see Procfile — which imports `app` directly
+    # and never reaches this block.
+    debug = os.environ.get("FLASK_DEBUG") == "1"
+    port = int(os.environ.get("PORT", 5050))
+    app.run(debug=debug, host="0.0.0.0", port=port)
