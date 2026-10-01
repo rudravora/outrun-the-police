@@ -23,6 +23,8 @@
   .bad { color: #f66; }
   .node-chip { display: inline-block; padding: 3px 8px; margin: 2px; border-radius: 4px; border: 1px solid #444; cursor: pointer; font-size: 12px; }
   .node-chip.compromised { background: #7a2a2a; border-color: #9a3a3a; }
+  .team-chip { display: inline-block; padding: 2px 6px; margin: 2px; border-radius: 4px; border: 1px solid #7a5a1a; background: #4a3a10; color: #f0c060; font-size: 12px; }
+  .team-chip button { font-size: 11px; padding: 1px 6px; margin-left: 6px; background: #7a5a1a; border-color: #9a7a2a; }
   #login { max-width: 360px; margin: 80px auto; }
   #app { display: none; max-width: 1000px; margin: 0 auto; }
   .muted { color: #888; font-size: 12px; }
@@ -64,9 +66,20 @@
   </section>
 
   <section>
-    <h2>Compromised Nodes</h2>
-    <p class="hint">Click a node to toggle compromised. Takes effect immediately on the next submission — no reload needed.</p>
+    <h2>Compromised Nodes (Global — all teams)</h2>
+    <p class="hint">Click a node to toggle compromised for EVERY team. Takes effect immediately on the next submission — no reload needed.</p>
     <div id="node-grid"></div>
+  </section>
+
+  <section>
+    <h2>Compromised Nodes (Per-Team — this team only)</h2>
+    <p class="hint">Amber = per-team, not global. Blocks only the listed team's submissions. Also set live by other games via the integration API (see API-CONTRACT.md).</p>
+    <div class="row">
+      <input id="team-compromise-team" placeholder="team code">
+      <input id="team-compromise-node" placeholder="node id, e.g. N15">
+      <button class="primary" onclick="addTeamCompromise()">Compromise for this team</button>
+    </div>
+    <div id="team-compromise-list"></div>
   </section>
 
   <section>
@@ -127,6 +140,7 @@ function authedFetch(url, opts) {
 function initApp() {
   loadClock();
   loadGraphForNodes();
+  loadTeamCompromised();
   loadLeaderboard();
   loadSubmissions();
   toggleAutoRefresh();
@@ -179,6 +193,42 @@ function toggleNode(nodeId, compromised) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ node_id: nodeId, compromised: compromised })
   }).then(r => r.json()).then(() => loadGraphForNodes());
+}
+
+function loadTeamCompromised() {
+  authedFetch('/api/admin/team_compromised').then(r => r.json()).then(rows => {
+    const el = document.getElementById('team-compromise-list');
+    el.innerHTML = '';
+    if (rows.length === 0) {
+      el.innerHTML = '<span class="muted">No per-team compromises active.</span>';
+      return;
+    }
+    rows.forEach(row => {
+      const chip = document.createElement('span');
+      chip.className = 'team-chip';
+      chip.innerHTML = `${row.team_code}: ${row.node_id} <button onclick="removeTeamCompromise('${row.team_code}','${row.node_id}')">clear</button>`;
+      el.appendChild(chip);
+    });
+  });
+}
+
+function addTeamCompromise() {
+  const team_code = document.getElementById('team-compromise-team').value.trim();
+  const node_id = document.getElementById('team-compromise-node').value.trim();
+  if (!team_code || !node_id) return;
+  authedFetch('/api/admin/team_compromise', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ team_code, node_id, compromised: true })
+  }).then(r => r.json()).then(() => loadTeamCompromised());
+}
+
+function removeTeamCompromise(team_code, node_id) {
+  authedFetch('/api/admin/team_compromise', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ team_code, node_id, compromised: false })
+  }).then(r => r.json()).then(() => loadTeamCompromised());
 }
 
 function loadLeaderboard() {

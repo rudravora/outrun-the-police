@@ -16,6 +16,250 @@ Format per entry:
 
 ---
 
+## 2026-09-30 (Claude Code — Milestone 4: team frontend)
+- Milestone 4 DONE: team-facing frontend, `game/templates/team.html`, served
+  by new `GET /team` in `game/app.py`. No frontend framework/build step —
+  plain HTML + vanilla JS `fetch`, one external CDN script (vis-network, for
+  the graph render only), matching the admin panel's existing stack.
+- Backend additions needed to support it (`game/app.py`):
+  - `GET /api/team/<team_code>/history` — the per-team read endpoint PRD
+    8.2 asks for ("personal submission history, their own attempts only").
+    Didn't exist before this session; checked first, confirmed missing, then
+    added it. Scoped by a single `WHERE team_code = ?` — no auth beyond
+    knowing your own code, same trust model as `/api/submit_route` itself
+    (PRD's "codes only, no passwords" default). Verified TEAM1 and TEAM2
+    histories are fully isolated (curl'd both after seeding each with
+    different routes — each only ever saw its own rows).
+  - `GET /api/graph.json` / `GET /api/graph.csv` — plain static download of
+    the actual Milestone-1-generated files via `send_from_directory`, not a
+    re-serialization. Verified byte-identical (`diff`) against
+    `game/graph.json` / `game/graph.csv` on disk.
+  - `GET /team` — serves the page, no server-side auth (matches `/admin`'s
+    pattern: the page is static, real access control is that a team can
+    only ever query/submit under its own code).
+- Team login: team code only, no password, per PRD 8.2/functional spec —
+  the code is stored in `localStorage` client-side purely so the page
+  remembers it on reload, not used for any auth beyond being the `team_code`
+  value sent to already-open endpoints.
+- Graph view: renders `GET /api/graph` exactly as returned — no client-side
+  recomputation of `open_now`/`compromised`, matches the instruction. Node
+  colors: green = HIDEOUT, red = EXTRACTION, amber = compromised, using the
+  API's own `g.hideout`/`g.extraction`/`n.compromised` fields directly.
+  Closed-now edges rendered faded/thin rather than removed, so teams can see
+  the whole map (consistent with why `/api/graph` never strips closed
+  edges). Plain JSON/CSV download links sit next to the graph and work
+  independently of vis-network loading — verified by reading the HTML: the
+  download `<a>` tags aren't inside any JS-gated block, and `showFallback()`
+  only ever swaps the graph canvas for a text notice, it never touches the
+  downloads or the submission form.
+- Submission form: posts `{team_code, route}` to `/api/submit_route`
+  exactly as Milestone 2 defined it, renders `accepted`/`reason`/
+  `breakdown`/`is_new_best` directly from the real response — no
+  reformatting of the reason string, so a rejection reason is shown to
+  teams verbatim (e.g. `"no edge from N00 to N59"`, `"N15 is compromised"`),
+  which matters since PRD 8.5 requires rejections to always carry a clear
+  reason string.
+- History table reads the new `/api/team/<code>/history` endpoint, newest
+  first, shows route/status/score/event-time per row.
+- No leaderboard on this page — confirmed intentional per PRD §11 default 5
+  (admin-only) and the explicit instruction; `/api/leaderboard` stays
+  admin-token-gated and untouched.
+- Visual theme ("Money Heist"-inspired, not a reproduction — no mask/logo
+  assets used, original layout/palette only): near-black background
+  (`#0c0c0d`/`#171415` panels), red `#c81e1e`/`#ff3b3b` as primary/bright
+  accent, amber `#d99a2b`/`#f5b942` for compromised-state and secondary
+  accents, off-white text `#f2ece7`. Headings: Google Fonts **Oswald**
+  (condensed/industrial, free, loaded via `<link>` not hotlinked from
+  elsewhere). Body/data text: **IBM Plex Mono** (monospace, chosen over a
+  plain sans so route lists / node IDs / scores stay legible and
+  columnar — data-under-time-pressure legibility over vibe, per the
+  instruction). Event clock rendered as a countdown-style readout
+  (`T+MMM:SS`) in a black box with amber border rather than a plain number.
+  Accepted submissions get a green-bordered panel headlined "JOB'S DONE —
+  ROUTE ACCEPTED"; rejections get a red-bordered panel with a brief pulse
+  animation headlined "BLOWN — ROUTE REJECTED" — but the actual
+  `reason`/breakdown text underneath is always the literal, unstyled string
+  from the API, so the mission-outcome framing never obscures what actually
+  happened (explicit instruction: style must never cost clarity on pass/
+  fail). These exact palette/font values are recorded here so `admin.html`
+  can be reskinned to match later if Rudra wants visual consistency —
+  admin.html was **not** touched this session.
+- **Actually tested against the real server** (`ADMIN_TOKEN=test-token`,
+  fresh `game.db`, port 5050):
+  - `GET /team` → 200. `GET /api/graph.json` → 200, byte-identical to
+    `game/graph.json` on disk (`diff`, exit 0). `GET /api/graph.csv` → 200,
+    byte-identical to `game/graph.csv`. Content-Type headers confirmed:
+    `application/json` and `text/csv; charset=utf-8`.
+  - Submitted TEAM1's known-good route (`N00→N15→N30→N45→N59`) → accepted,
+    breakdown `time=35 risk=8 cost=22 score=78.0`, `is_new_best: true` —
+    matches Milestone 2's already-verified reference numbers exactly (no
+    drift from reusing the same solver path).
+  - Submitted TEAM1 an invalid route (`N00→N59`, no direct edge) →
+    rejected, `reason: "no edge from N00 to N59"` — exact string the
+    frontend's rejection panel would render verbatim.
+  - Submitted TEAM2 a different route (`N00→N03→N07→N59`, the known trap
+    route) → accepted, `score=235.0`.
+  - **Isolation check (the thing most likely to leak)**: `GET
+    /api/team/TEAM1/history` → exactly TEAM1's 2 attempts (1 accepted, 1
+    rejected), TEAM2's route nowhere in the response. `GET
+    /api/team/TEAM2/history` → exactly TEAM2's 1 attempt, none of TEAM1's
+    rows. `GET /api/team/NOBODY/history` (team that never submitted) →
+    `[]`, no error. Confirms the new endpoint is genuinely team-scoped, not
+    just filtered client-side.
+  - `GET /api/graph` shape checked field-by-field against what
+    `team.html`'s JS actually reads: `nodes[].id`/`.compromised`,
+    `edges[].id/from/to/time/risk/cost/window_start/window_end/open_now`,
+    top-level `hideout`/`extraction`/`event_time`/`compromised_nodes` — all
+    present and correctly typed, confirmed by admin-compromising N15 live
+    and re-fetching `/api/graph`: `N15`'s node object flipped to
+    `compromised: true` and appeared in `compromised_nodes`, matching
+    exactly what the renderer keys off. Uncompromised it after.
+  - Malformed submission (missing `team_code`) → 400
+    `{"error": "team_code is required"}`, same as Milestone 2, unchanged.
+  - Cleaned up: killed the test server, deleted the test `game.db`.
+- **Testing caveat, same as the admin-panel session**: the Claude-in-Chrome
+  browser extension is still not connected in this environment
+  (`tabs_context_mcp` → "Browser extension is not connected"), so **no
+  actual click-through/visual render check happened this session** — not
+  for the graph rendering, not for the color/contrast/font choices, not for
+  mobile/narrow-width behavior. Everything above is real API-level and
+  response-shape verification (the JS was read against confirmed real
+  response fields, not assumed), which proves the data flow is correct, but
+  it does **not** prove vis-network actually renders correctly in a live
+  browser, that the fallback text-notice path visually triggers correctly
+  if the CDN script fails to load, or that the red/amber palette is
+  actually legible at a glance in a bright event hall. **Recommend an
+  actual browser click-through before the event** — open
+  `http://127.0.0.1:5050/team` manually (or once the Chrome extension is
+  connected), test login, watch the graph actually render, submit a real
+  route and confirm the accept/reject panels look right, and eyeball
+  contrast on a laptop screen under normal room lighting.
+- What's broken / left for next session:
+  - Nothing known-broken from what could be tested via API.
+  - Visual/UX confirmation in an actual browser is the main open item (see
+    caveat above) — do this before the event, not after.
+  - `admin.html` still uses its original plain styling, not yet reskinned
+    to match — optional, only worth doing if Rudra wants visual consistency
+    across both pages (palette/fonts recorded above for exactly that).
+  - Milestone 5 (end-to-end test with fake teams simulating the
+    `context.md` live-event walkthrough) not started.
+
+## 2026-09-29 (Claude Code — cross-game integration session)
+- Resolved PRD §11 Open Question 4 (compromise triggers) with Rudra:
+  **auto-linking to other games is now real**, not just a stretch goal —
+  built the integration surface the other four games call.
+- **Auth decision**: one API key per calling game, issued by us, config'd
+  as a `game_name -> key` map in `game/integration_auth.py` (env var
+  `INTEGRATION_KEYS`, format `game3:key1,game5:key2`) — not hardcoded per
+  route, not a single shared secret. Deliberately kept in one small module
+  behind a single `require_game_key()` function (mirrors `require_admin()`
+  in `app.py`) so if the event later builds a central cross-game gateway
+  that issues one key for everyone (still being decided elsewhere), only
+  this one file changes — no route code touches auth logic directly.
+- **Compromise data model gained a second layer** — this is a schema
+  change other sessions/branches need to know about (see note for the
+  testing/deployment branch below):
+  - Existing `compromised_nodes` table (global, admin-only) is **completely
+    unchanged** — same schema, same `/api/admin/compromise` endpoint, same
+    admin-panel toggle grid. Did not touch it.
+  - New `team_compromised_nodes(team_code, node_id, set_by, set_at)` table
+    in `game/db.py` — a per-team compromise list, additive alongside the
+    global one.
+  - New `db.effective_compromised(team_code)` = union of global +
+    that team's per-team set. `/api/submit_route` now calls this instead
+    of the old global-only `db.get_compromised()` — this is the one call
+    site that changed in the existing submission path, everything else
+    about validation is untouched (`solver.validate_path()` itself didn't
+    need to change, it already took an arbitrary `compromised` set).
+- Built (`game/app.py`):
+  - `POST /api/admin/team_compromise` — admin-token-gated, same pattern as
+    the existing global toggle but scoped to one `team_code`.
+  - `GET /api/admin/team_compromised` — admin-token-gated, lists every
+    active per-team compromise (for the panel's per-team view).
+  - `GET /api/integration/leaderboard` — game-key-gated, every team's best
+    score + time/risk/cost breakdown + `has_valid_route`.
+  - `GET /api/integration/result/<team_code>` — game-key-gated, one team's
+    current best valid route + breakdown; 404 with `has_valid_route: false`
+    if they don't have one yet.
+  - `POST /api/integration/compromise-trigger` — game-key-gated,
+    `{team_code, node_id, reason}` -> writes into the NEW per-team list.
+    `set_by` records the calling game name + reason for audit
+    (`"integration:game3:bad result"`), same as `set_by: "admin"` for
+    manual toggles.
+- Admin panel (`game/templates/admin.html`): added a second compromise
+  section directly below the existing global grid, **styled amber/orange**
+  vs. the global list's red, with its own heading "(Per-Team — this team
+  only)" right next to "(Global — all teams)" on the original section —
+  organizers can't confuse which is which at a glance. Simple
+  team-code + node-id input + button to add, chip list with a "clear"
+  button per entry to remove. Did not touch or restyle the existing global
+  grid at all.
+- Wrote `brain/API-CONTRACT.md` — the handoff doc for the other four
+  games' developers. Documents all three integration endpoints' exact
+  request/response JSON, the `X-Game-Key` header, and error shapes, written
+  assuming zero familiarity with this codebase (no internal function/table
+  names, just the HTTP contract). Also notes the auth-swap-to-gateway
+  possibility so nobody's surprised if that header's meaning changes later.
+- **Actually tested it live**, not just read the code (server on :5050,
+  `ADMIN_TOKEN=test-token`, `INTEGRATION_KEYS=game3:g3key,game5:g5key`):
+  - Seeded TEAM1 and TEAM2 both with the reference best-score route
+    (score 78.0) via the normal `/api/submit_route`.
+  - `GET /api/integration/leaderboard` with no key -> 401; wrong key ->
+    401; correct key -> 200 with both teams, correct breakdown fields.
+  - `GET /api/integration/result/TEAM1` with correct key -> 200, exact
+    route + score match. `result/NOBODY` (team with no valid route) -> 404
+    with `has_valid_route: false`.
+  - `POST /api/integration/compromise-trigger` with no key -> 401.
+    Correct key (`game3`), compromised `N15` for `TEAM1` only, reason
+    `"bad game3 result"` -> 200. **TEAM1 resubmitted the exact same
+    previously-accepted route -> rejected `"N15 is compromised"`.
+    TEAM2 resubmitted the identical route in between -> still accepted,
+    same score 78.0** — confirms the per-team block is genuinely isolated,
+    not a global side-effect.
+  - Confirmed the existing global list is untouched: admin-compromised
+    `N30` globally -> TEAM2 (unaffected by the per-team block above) was
+    then rejected too, exactly as global compromise has always worked.
+    Uncompromised it after.
+  - Admin per-team endpoints: `GET /api/admin/team_compromised` (no
+    token -> 401; with token -> showed the live TEAM1/N15 entry with
+    correct `set_by: "integration:game3:bad game3 result"`).
+    `POST /api/admin/team_compromise` with `compromised: false` cleared
+    it -> confirmed TEAM1 could then resubmit and be accepted again
+    (score 78.0, matching before).
+  - Malformed input: `compromise-trigger` missing `team_code` -> 400;
+    unknown `node_id` -> 400. Same for `admin/team_compromise`.
+  - Restart survival: killed and restarted the server mid-test, re-queried
+    `/api/admin/team_compromised` (correctly empty, since TEAM1's entry had
+    been cleared before restart) and `/api/integration/leaderboard`
+    (both teams' scores intact) — new table persists to the same SQLite
+    file, no special handling needed.
+  - Re-ran `solver.py`'s self-check after all changes — still passes,
+    confirms the shared validation core wasn't touched.
+  - Cleaned up: killed the test server, deleted the test `game.db`.
+- **Note for the teammate on the testing/deployment branch**: the
+  compromised-node data model just gained a second layer
+  (`team_compromised_nodes`, on top of the existing `compromised_nodes`
+  which is unchanged). **Pull latest `main` before finalizing your own
+  compromised-node test cases** — anything written against "compromise ==
+  one global table" is testing the old shape. The thing to know: a node is
+  now blocked for a team if it's in *either* table (`db.effective_compromised`
+  in `game/db.py` is the one function that does this union — call that
+  instead of re-deriving the union yourself if your tests need to compute
+  expected-blocked state). Global-only compromise tests you already have
+  should still pass unchanged since that table/endpoint didn't move.
+- What's broken / left for next session:
+  - Nothing known-broken from what was tested.
+  - `INTEGRATION_KEYS` currently only comes from an env var with a dev
+    fallback (`game3:dev-game3-key,game5:dev-game5-key`) baked into
+    `integration_auth.py` — same caveat as `ADMIN_TOKEN`: **must** be set
+    to real per-game secrets via env var before the event, don't ship the
+    dev fallback live.
+  - Milestone 4 (team-facing frontend) still not started — this session
+    was integration-backend-only, per the actual instructions given (the
+    "Milestone 4" label in the request didn't match PRD §12's Milestone 4;
+    treated the explicit build list in the request as authoritative and
+    flagged this here rather than silently building the wrong thing).
+
 ## 2026-09-28 (Claude Code — build session 3)
 - Milestone 3 DONE: admin panel, built in `game/templates/admin.html`,
   served by a new `GET /admin` route in `game/app.py`.
