@@ -216,10 +216,30 @@
     letter-spacing: 0.06em;
   }
 
-  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  #route-code-panel { border-color: var(--amber); }
+  #route-code-value {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 2.2rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--amber-bright);
+    background: #000;
+    border: 1px solid var(--amber);
+    border-radius: 5px;
+    padding: 14px 20px;
+    margin-top: 8px;
+    display: inline-block;
+    user-select: all;
+  }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; table-layout: fixed; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); overflow-wrap: break-word; }
   th { color: var(--text-dim); font-weight: 600; text-transform: uppercase; font-size: 0.68rem; letter-spacing: 0.05em; }
-  td.route-cell { max-width: 260px; overflow-x: auto; white-space: nowrap; font-size: 0.78rem; color: var(--text-dim); }
+  #history-table th:nth-child(1), #history-table td:nth-child(1) { width: 28px; }
+  #history-table th:nth-child(2), #history-table td:nth-child(2) { width: 90px; }
+  #history-table th:nth-child(4), #history-table td:nth-child(4) { width: 55px; }
+  #history-table th:nth-child(5), #history-table td:nth-child(5) { width: 70px; }
+  td.route-cell { white-space: normal; word-break: break-word; font-size: 0.78rem; color: var(--text-dim); line-height: 1.4; }
   .status-pill { padding: 2px 8px; border-radius: 10px; font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
   .status-pill.ok { background: rgba(63,159,95,0.2); color: var(--green); }
   .status-pill.bad { background: rgba(255,59,59,0.18); color: var(--red-bright); }
@@ -278,6 +298,12 @@
   <main>
     <div id="error-banner"></div>
 
+    <div class="panel" id="route-code-panel" style="display:none">
+      <h2>Your Route Code</h2>
+      <div class="hint">Your best accepted route, written down. You'll need this for Final Extraction &mdash; teams can't be expected to hand-copy a full node list.</div>
+      <div id="route-code-value"></div>
+    </div>
+
     <div class="panel">
       <h2>The City <small id="graph-meta"></small></h2>
       <div class="legend">
@@ -323,7 +349,7 @@
         <div style="overflow-x:auto">
         <table id="history-table" style="display:none">
           <thead>
-            <tr><th>#</th><th>Status</th><th>Route</th><th>Score</th><th>Event T</th></tr>
+            <tr><th>#</th><th>Status</th><th>Route</th><th>Risk</th><th>Event T</th></tr>
           </thead>
           <tbody id="history-body"></tbody>
         </table>
@@ -494,18 +520,25 @@ function renderResult(data, accepted) {
     if (b) {
       breakdown.innerHTML = `
         <div class="stat"><div class="val">${b.time}</div><div class="lbl">Time</div></div>
-        <div class="stat"><div class="val">${b.risk}</div><div class="lbl">Risk</div></div>
-        <div class="stat"><div class="val">${b.cost}</div><div class="lbl">Cost</div></div>
-        <div class="stat"><div class="val">${b.score}</div><div class="lbl">Score</div></div>`;
+        <div class="stat"><div class="val">${b.risk}</div><div class="lbl">Risk (score)</div></div>
+        <div class="stat"><div class="val">${b.cost}</div><div class="lbl">Cost</div></div>`;
     }
     if (data.is_new_best) {
       badge.innerHTML = '<span class="new-best-badge">New personal best</span>';
+    }
+    if (data.route_code) {
+      showRouteCode(data.route_code);
     }
   } else {
     panel.className = 'show rejected';
     headline.textContent = 'BLOWN — ROUTE REJECTED';
     reason.textContent = data.reason || 'Route failed validation.';
   }
+}
+
+function showRouteCode(code) {
+  document.getElementById('route-code-panel').style.display = 'block';
+  document.getElementById('route-code-value').textContent = code;
 }
 
 async function loadHistory() {
@@ -517,6 +550,15 @@ async function loadHistory() {
     const table = document.getElementById('history-table');
     const body = document.getElementById('history-body');
     const empty = document.getElementById('history-empty');
+
+    // The best (lowest-risk) valid row with a route_code is the team's
+    // current best — route_code is only ever set on a new-best submission,
+    // so the lowest-risk valid row always has one if any valid row exists.
+    const best = rows
+      .filter(r => r.valid && r.route_code)
+      .sort((a, b) => a.risk - b.risk)[0];
+    if (best) showRouteCode(best.route_code);
+
     if (rows.length === 0) {
       table.style.display = 'none';
       empty.style.display = 'block';

@@ -86,7 +86,7 @@
     <h2>Leaderboard</h2>
     <button class="secondary" onclick="loadLeaderboard()">Refresh</button>
     <table id="leaderboard-table">
-      <thead><tr><th>Team</th><th>Best score</th></tr></thead>
+      <thead><tr><th>Team</th><th>Best (lowest) risk</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -237,7 +237,8 @@ function loadLeaderboard() {
     tbody.innerHTML = '';
     rows.forEach(row => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${row.team_code}</td><td>${row.best_score.toFixed(1)}</td>`;
+      const risk = row.risk != null ? row.risk.toFixed(1) : '&mdash;';
+      tr.innerHTML = `<td>${row.team_code}</td><td>${risk}</td>`;
       tbody.appendChild(tr);
     });
   });

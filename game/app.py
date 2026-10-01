@@ -20,15 +20,37 @@ Admin (all require header X-Admin-Token matching ADMIN_TOKEN):
   GET  /api/admin/export          -> best valid route per team, JSON
   GET  /api/admin/export.csv      -> same, CSV
 
-Cross-game integration (all require header X-Game-Key, see integration_auth.py
-and brain/API-CONTRACT.md for the full contract):
+Cross-game integration, LEGACY (all require header X-Game-Key, see
+integration_auth.py and brain/API-CONTRACT.md for the full contract) — left
+in place for any game still mid-switch, but SUPERSEDED by the real central
+gateway below; nothing new is built on this path:
   GET  /api/integration/leaderboard        -> every team's best score + breakdown
   GET  /api/integration/result/<team_code> -> one team's current best valid route
   POST /api/integration/compromise-trigger -> {team_code, node_id, reason} -> per-team compromise
 
-A node is blocked for a team's submission if it's in EITHER the global
-compromised list OR that team's own per-team list (db.effective_compromised).
-The global list is unchanged from before; the per-team list is additive.
+Central gateway integration (see brain/GATEWAY-INTEGRATION-SPEC.md,
+game/gateway_client.py): on every accepted submission we send a `solved`
+event (risk = route risk); on a new best we also send `output_issued` with
+the route code. We read the gateway's per-team state (balance + any
+gateway-side compromised_nodes) via game/budget.py and inside
+/api/submit_route — see gateway_client.get_team_state(). Any gateway call
+that fails or times out (3s) falls back silently (budget -> BUDGET_DEFAULT,
+compromised_nodes -> skipped) and never blocks a submission; failed sends
+queue in the local gateway_outbox table and retry on a background thread.
+
+A node is blocked for a team's submission if it's in the global compromised
+list, that team's own admin/integration per-team list, OR the gateway's
+per-team compromised_nodes (db.effective_compromised plus the gateway merge
+in api_submit_route). The global list is unchanged from before; the other
+two are additive.
+
+Scoring model (as of the budget/deadline-constrained rework — see
+brain/logs.md): a route is scored by RISK ALONE (lower = better). Total time
+must be <= the graph's event_duration (the deadline) and total cost must be
+<= the submitting team's budget (game/budget.py) — a route that breaks
+either cap is REJECTED, not penalized. This replaced the old weighted-sum
+score (time*1.0 + risk*4.0 + cost*0.5); see solver.min_risk_constrained for
+the algorithm and solver.validate_path for the enforcement.
 
 Event-day clock policy: `action: set` (jump to a specific minute) is the
 primary mechanism organizers use, matching how compromise events are
@@ -50,14 +72,16 @@ from pathlib import Path
 from flask import Flask, jsonify, request, Response, render_template, send_from_directory
 
 import db
+import gateway_client
+from budget import get_team_budget
 from integration_auth import require_game_key
-from solver import load_graph, validate_path, path_totals, path_score
+from route_code import compute_route_code
+from solver import load_graph, validate_path, path_totals
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")
 
 app = Flask(__name__)
 GRAPH = load_graph()
-WEIGHTS = GRAPH["weights"]
 GAME_DIR = Path(__file__).parent
 
 
@@ -88,9 +112,8 @@ def visible_graph(t, compromised):
         "edges": edges,
         "hideout": GRAPH["hideout"],
         "extraction": GRAPH["extraction"],
-        "weights": WEIGHTS,
         "event_time": t,
-        "event_duration": GRAPH["event_duration"],
+        "event_duration": GRAPH["event_duration"],  # also the submission deadline (total time cap)
         "compromised_nodes": sorted(compromised),
     }
 
@@ -154,39 +177,77 @@ def api_submit_route():
 
     t = db.current_event_t(conn)
     compromised = db.effective_compromised(team_code, conn)
+    # Gateway-reported compromised nodes are a third source, additive to the
+    # existing two (global admin list + per-team admin/integration list) —
+    # see brain/GATEWAY-INTEGRATION-SPEC.md §3B. get_team_state() already
+    # has its own 3s timeout and returns None on any failure, so this never
+    # adds latency beyond that or blocks a submission on a down gateway.
+    gw_state = gateway_client.get_team_state(team_code)
+    if gw_state is not None and gw_state.get("compromised_nodes"):
+        compromised = compromised | {str(n) for n in gw_state["compromised_nodes"]}
 
-    ok, reason, edges = validate_path(GRAPH, route, t=t, compromised=compromised)
+    deadline = GRAPH["event_duration"]
+    budget = get_team_budget(team_code)
+
+    ok, reason, edges = validate_path(
+        GRAPH, route, t=t, compromised=compromised, deadline=deadline, budget=budget
+    )
 
     result = {
         "accepted": ok,
         "reason": reason,
         "route": route,
         "event_time": t,
+        "deadline": deadline,
+        "budget": budget,
     }
 
     time_total = risk_total = cost_total = score_val = None
+    route_code = None
+    is_new_best = False
     if ok:
         totals = path_totals(edges)
-        score_val = path_score(edges, WEIGHTS)
         time_total, risk_total, cost_total = totals["time"], totals["risk"], totals["cost"]
-        result["breakdown"] = {**totals, "score": score_val}
+        score_val = risk_total  # score == risk now; lower is still better
+        result["breakdown"] = totals
 
-        # is this the team's new best valid submission? (lower score = better)
+        # is this the team's new best valid submission? (lower risk = better)
         best = conn.execute(
             "SELECT MIN(score) AS best_score FROM submissions WHERE team_code = ? AND valid = 1",
             (team_code,),
         ).fetchone()
-        result["is_new_best"] = best["best_score"] is None or score_val < best["best_score"]
+        is_new_best = best["best_score"] is None or score_val < best["best_score"]
+        result["is_new_best"] = is_new_best
+        if is_new_best:
+            route_code = compute_route_code(team_code, route, score_val)
+            result["route_code"] = route_code
+    elif gateway_client.SEND_WRONG_ATTEMPTS:
+        # Off by default — see gateway_client.SEND_WRONG_ATTEMPTS docstring
+        # and brain/logs.md for why (ambiguous for us in the spec).
+        gateway_client.send_event("wrong_attempt", team_code, meta={"reason": reason})
 
     conn.execute(
         """INSERT INTO submissions
-           (team_code, route_json, valid, reason, time_total, risk_total, cost_total, score, submitted_at, event_t)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (team_code, route_json, valid, reason, time_total, risk_total, cost_total, score,
+            submitted_at, event_t, route_code)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (team_code, json.dumps(route), int(ok), reason, time_total, risk_total, cost_total,
-         score_val, time.time(), t),
+         score_val, time.time(), t, route_code),
     )
     conn.commit()
     conn.close()
+
+    if ok:
+        # Spec §4 p2g4: "On each accepted route: send solved with risk =
+        # route risk" — every accepted submission, not just new-best.
+        # Points formula is a placeholder — see brain/logs.md, still TBD
+        # with the gateway owner.
+        points = max(0, 1000 - int(risk_total * 10))
+        gateway_client.send_event("solved", team_code, points=points, risk=risk_total)
+        if is_new_best:
+            # Spec §4 p2g4: "For the team's best accepted route, send
+            # output_issued with meta.value = a short ROUTE CODE."
+            gateway_client.send_event("output_issued", team_code, meta={"value": route_code})
 
     return jsonify(result), (200 if ok else 422)
 
@@ -200,7 +261,7 @@ def api_team_history(team_code):
     conn = db.get_conn()
     rows = conn.execute(
         """SELECT id, route_json, valid, reason, time_total, risk_total, cost_total,
-                  score, submitted_at, event_t
+                  score, submitted_at, event_t, route_code
            FROM submissions WHERE team_code = ? ORDER BY submitted_at DESC""",
         (team_code,),
     ).fetchall()
@@ -217,6 +278,7 @@ def api_team_history(team_code):
             "score": r["score"],
             "submitted_at": r["submitted_at"],
             "event_t": r["event_t"],
+            "route_code": r["route_code"],
         }
         for r in rows
     ])
@@ -224,18 +286,17 @@ def api_team_history(team_code):
 
 @app.route("/api/leaderboard", methods=["GET"])
 def api_leaderboard():
-    # Admin-only visibility per PRD §11 default 5.
+    # Admin-only visibility per PRD §11 default 5. Ranked by lowest risk
+    # among each team's valid (within deadline/budget) submissions.
     err = require_admin()
     if err:
         return err
     conn = db.get_conn()
-    rows = conn.execute(
-        """SELECT team_code, MIN(score) AS best_score
-           FROM submissions WHERE valid = 1
-           GROUP BY team_code ORDER BY best_score ASC"""
-    ).fetchall()
+    team_codes = [r["team_code"] for r in conn.execute("SELECT team_code FROM teams").fetchall()]
+    out = [_team_summary(conn, team_code) for team_code in team_codes]
     conn.close()
-    return jsonify([{"team_code": r["team_code"], "best_score": r["best_score"]} for r in rows])
+    out.sort(key=lambda r: (r["risk"] is None, r["risk"]))
+    return jsonify(out)
 
 
 @app.route("/api/admin/compromise", methods=["POST"])
@@ -421,6 +482,10 @@ def admin_export_csv():
 
 
 def _best_row_for_team(conn, team_code):
+    """Best valid submission for a team. 'valid' already means it passed
+    validate_path() — within deadline, within that team's budget-at-submit-
+    time, no compromised node, real open edges. `score` column holds risk
+    (lower is better) under the current model."""
     return conn.execute(
         """SELECT team_code, route_json, time_total, risk_total, cost_total, score
            FROM submissions WHERE team_code = ? AND valid = 1
@@ -429,38 +494,42 @@ def _best_row_for_team(conn, team_code):
     ).fetchone()
 
 
+def _team_summary(conn, team_code):
+    best = _best_row_for_team(conn, team_code)
+    return {
+        "team_code": team_code,
+        "has_valid_route": best is not None,
+        "risk": best["risk_total"] if best else None,
+        "time": best["time_total"] if best else None,
+        "cost": best["cost_total"] if best else None,
+        "budget": get_team_budget(team_code),
+        "deadline": GRAPH["event_duration"],
+    }
+
+
 @app.route("/api/integration/leaderboard", methods=["GET"])
 def integration_leaderboard():
-    """Cross-game read: every team's best score + breakdown + whether they
-    have a valid route yet. Gated by a per-game API key (X-Game-Key), not
-    the admin token — see integration_auth.py. Documented in
-    brain/API-CONTRACT.md."""
+    """Cross-game read: every team's best (lowest-risk) valid route +
+    breakdown + whether they have a valid route yet. Gated by a per-game API
+    key (X-Game-Key), not the admin token — see integration_auth.py.
+    Documented in brain/API-CONTRACT.md."""
     err = require_game_key()
     if err:
         return err
     conn = db.get_conn()
     team_codes = [r["team_code"] for r in conn.execute("SELECT team_code FROM teams").fetchall()]
-    out = []
-    for team_code in team_codes:
-        best = _best_row_for_team(conn, team_code)
-        out.append({
-            "team_code": team_code,
-            "has_valid_route": best is not None,
-            "best_score": best["score"] if best else None,
-            "time": best["time_total"] if best else None,
-            "risk": best["risk_total"] if best else None,
-            "cost": best["cost_total"] if best else None,
-        })
+    out = [_team_summary(conn, team_code) for team_code in team_codes]
     conn.close()
-    out.sort(key=lambda r: (r["best_score"] is None, r["best_score"]))
+    out.sort(key=lambda r: (r["risk"] is None, r["risk"]))
     return jsonify(out)
 
 
 @app.route("/api/integration/result/<team_code>", methods=["GET"])
 def integration_result(team_code):
-    """Cross-game read: one team's current best valid submission (route +
-    score breakdown). Same X-Game-Key auth as the leaderboard above. This is
-    what Game 5 polls live instead of waiting for the end-of-game export."""
+    """Cross-game read: one team's current best (lowest-risk) valid
+    submission (route + breakdown). Same X-Game-Key auth as the leaderboard
+    above. This is what Game 5 polls live instead of waiting for the
+    end-of-game export."""
     err = require_game_key()
     if err:
         return err
@@ -476,7 +545,6 @@ def integration_result(team_code):
         "time": best["time_total"],
         "risk": best["risk_total"],
         "cost": best["cost_total"],
-        "score": best["score"],
     })
 
 
@@ -512,4 +580,8 @@ def integration_compromise_trigger():
 
 if __name__ == "__main__":
     db.init_db()
+    # Flask's debug reloader spawns a parent + child process; only start the
+    # outbox-drain thread in the actual worker (avoids running it twice).
+    if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        gateway_client.start_drain_thread()
     app.run(debug=True, port=5050)

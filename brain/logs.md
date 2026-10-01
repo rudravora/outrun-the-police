@@ -16,6 +16,531 @@ Format per entry:
 
 ---
 
+## 2026-10-02 (Claude Code — real central gateway integration)
+- **New scope, confirmed by Rudra**: implement the actual CODEVERSE 2.0
+  central gateway integration per `brain/GATEWAY-INTEGRATION-SPEC.md`
+  (saved verbatim — Rudra pasted it after an initial request referenced it
+  before it had actually been attached; saved first, built against it
+  second, per the instruction). This **supersedes** the direct
+  game-to-game `/api/integration/*` endpoints from the 2026-09-29 session
+  — per the spec, "games never call each other," everything goes through
+  the gateway. Left the old endpoints running (not deleted, other games
+  may be mid-switch) but nothing new is built on that path — see the
+  superseded notice added to the top of `brain/API-CONTRACT.md`.
+- **Key facts taken as given** (per the request, already confirmed with
+  the gateway owner, overriding the spec doc's own `T01`/`T07`/`T00`
+  example codes): our existing `team_code` IS the gateway's `team_id`,
+  no mapping table. Our `game_id` is `"p2g4"`.
+- **The real base URL/API key/test team T00 are not shared yet** (spec
+  §6 timeline, still `<date>` placeholders) — built and tested entirely
+  against a local mock (`game/gateway_mock.py`), with the real values as
+  swappable env vars (`GATEWAY_BASE_URL`, `GATEWAY_API_KEY`). **Nothing
+  here has touched the real gateway** — that's still to come once Rudra
+  gets the real values.
+- **`game/gateway_client.py` (new)**: the one module that talks to the
+  gateway, per spec §2's global rules.
+  - `send_event(event_type, team_id, points=0, money_delta=0, risk=None,
+    meta=None)` — builds the event body exactly per spec §3A
+    (`event_id` uuid4, `game_id`, ISO-UTC `timestamp`, the rest as given),
+    POSTs to `/api/events` with `X-Game-Key`, 3s timeout. **Never raises**:
+    any failure (not configured, timeout, connection error, non-2xx)
+    queues the event into a new `gateway_outbox` SQLite table
+    (`game/db.py`) instead — a submission can never fail because the
+    gateway is unreachable, per spec §2 rule 6. A `409` (duplicate
+    `event_id`) is treated as success per spec §2 rule 4/§2 rule 9, not
+    an error.
+  - `get_team_state(team_id)` — GETs `/api/teams/{id}/state`, same
+    header/timeout, returns the parsed dict on success or `None` on ANY
+    failure. Callers decide their own fallback; this function never
+    raises into request handling.
+  - `drain_outbox_once()` + `start_drain_thread()` — a single simple
+    daemon thread, retries every `GATEWAY_DRAIN_INTERVAL` seconds
+    (default 15, spec's 10-30s range), blind-retries every pending outbox
+    row since retries are idempotent (spec §2 rule 4) — on success marks
+    delivered, on failure just bumps the attempt counter and leaves it
+    queued for next cycle. Deliberately simple (no backoff/pooling) since
+    this is a handful-of-events-per-minute workload, not high-throughput.
+  - **No-op when unconfigured**: if `GATEWAY_BASE_URL`/`GATEWAY_API_KEY`
+    are unset, `send_event` only queues locally (never calls out) and
+    `get_team_state` always returns `None` — confirmed local dev/testing
+    without any gateway configured still works exactly as before this
+    session (tested below).
+  - `SEND_WRONG_ATTEMPTS` config flag (env var, default `false`) — see
+    the open question below.
+  - Used **stdlib `urllib.request`** instead of adding the `requests`
+    dependency (checked: not already installed, `game/requirements.txt`
+    only pins Flask) — two simple JSON-in/JSON-out calls with a timeout
+    don't need a new dependency per claude.md's lightweight-stack rule.
+- **`game/db.py`**: new `gateway_outbox` table (`event_id` PK, `body_json`,
+  `created_at`, `delivered`, `delivered_at`, `attempts`,
+  `last_attempt_at`) plus `outbox_enqueue`/`outbox_pending`/
+  `outbox_mark_delivered`/`outbox_mark_attempt` helpers. `INSERT OR
+  IGNORE` on enqueue so re-queuing the same `event_id` is a no-op,
+  matching the gateway's own idempotency. New `route_code TEXT` column on
+  `submissions` (see route-code feature below). **Did not** add a
+  gateway call inside `db.effective_compromised()` itself — kept that
+  function as the pure two-table (global + per-team admin/integration)
+  union it already was, to avoid a circular import
+  (`gateway_client.py` imports `db.py` for the outbox) and keep `db.py`
+  DB-only. The third source (gateway's `compromised_nodes`) is merged at
+  the one real call site instead — see `app.py` below.
+- **`game/budget.py`**: wired the swap point that was deliberately
+  stubbed in the 2026-10-01 scoring-rework session. `get_team_budget()`
+  now tries `gateway_client.get_team_state(team_code)` first and uses its
+  `balance` field if present; falls back to the existing
+  `BUDGET_DEFAULT` env var on `None` (gateway unreachable/not
+  configured) — exactly the one-line-swap-point design from that
+  session's docstring, now actually wired.
+- **`game/app.py` — `/api/submit_route`**:
+  - Calls `gateway_client.get_team_state(team_code)` once per submission
+    and unions its `compromised_nodes` (cast to `str`, since the spec's
+    own example shows ints (`[12, 31]`) while our node IDs are strings
+    like `"N15"` — treated as opaque and string-compared either way) into
+    the existing `db.effective_compromised()` result. This call already
+    carries its own 3s timeout and returns `None` on failure (same
+    function `get_team_budget` uses), so this never adds submission
+    latency beyond that single bounded call, and never blocks a
+    submission on a down gateway.
+  - **Route code feature** (spec §4 p2g4, new `game/route_code.py`):
+    on a new-best accepted submission, computes
+    `sha256(f"{team_code}:{'-'.join(route)}:{risk}")[:8]`, formatted as
+    `XXXX-XXXX`, stores it on that submission row, returns it in the
+    response as `route_code`, and sends it to the gateway via
+    `send_event("output_issued", team_code, meta={"value": route_code})`
+    — exactly per spec's `meta.value` field name.
+  - **`solved` on every accepted submission** (not just new-best), per
+    spec §4 p2g4 "On each accepted route: send solved", with
+    `risk=risk_total`. **Points formula is a placeholder**
+    (`max(0, 1000 - risk*10)`) — **flagging as still open with the
+    gateway owner**, the spec only says "points formula, max points" is
+    something we owe them in the questionnaire reply (§7.2), it doesn't
+    give us a number. Don't treat this formula as final.
+  - `wrong_attempt` is a capability behind `SEND_WRONG_ATTEMPTS` (default
+    off) that currently does nothing when a submission is rejected — see
+    "What's still open" below for why.
+  - `/api/team/<code>/history` now also returns `route_code` per row
+    (`null` unless that row was a new-best at submit time) — the
+    frontend finds "the team's current best code" as the lowest-risk
+    valid row with a non-null code, rather than needing a separate
+    endpoint.
+  - Drain thread started at app startup (`gateway_client.start_drain_thread()`
+    in the `__main__` block), guarded against Flask's debug-mode reloader
+    double-spawning it (checks `WERKZEUG_RUN_MAIN` so only the actual
+    worker process starts it, not the reloader's parent).
+- **`game/templates/team.html`**: new "Your Route Code" panel, amber-
+  bordered, large monospace (`2.2rem`) code display with `user-select:
+  all` (click once to select the whole code for copying) — sits right
+  below the header, above the graph, so it's the first thing visible
+  once a team has a best valid route. Populated two ways: immediately on
+  a new-best submission response (`renderResult` -> `showRouteCode`), and
+  on every page load/reload from `/api/team/<code>/history` (finds the
+  lowest-risk valid row with a `route_code`) — so a team that closes and
+  reopens the tab still sees their code, not just right after submitting.
+  Hidden (`display:none`) until a team has one.
+- **`brain/GATEWAY-INTEGRATION-SPEC.md`**: the full questionnaire/spec
+  doc, saved verbatim as instructed.
+- **`brain/API-CONTRACT.md`**: added a superseded notice at the top
+  (the old `/api/integration/*` contract is being replaced by the
+  gateway) and a new "Our outbound gateway behavior" section at the
+  bottom, informational for the gateway owner (what events we send, our
+  retry/timeout behavior, the open points-formula question).
+- **Tested against a local mock gateway** (`game/gateway_mock.py`, new —
+  implements `POST /api/events` and `GET /api/teams/{id}/state` per
+  spec §3A/§3B, plus `/mock/events` + `/mock/set_state` + `/mock/reset`
+  test-only helpers; explicitly NOT part of the real game, run
+  standalone on :5099):
+  - Real server on :5050 pointed at the mock (`GATEWAY_BASE_URL=
+    http://127.0.0.1:5099`, `GATEWAY_API_KEY=mock-gateway-key`,
+    `GATEWAY_DRAIN_INTERVAL=5`), mock seeded with `balance: 25.0`.
+  - Submitted a route costing 22 (affordable under the mock's 25 balance
+    but would exceed a smaller fallback) -> accepted, response showed
+    `"budget": 25.0` — **confirms the gateway's live balance is actually
+    used**, not the `BUDGET_DEFAULT=99` env fallback that was also set in
+    the same test run. `route_code` returned (`"AA33-FB43"`) since it was
+    the team's first/new-best submission.
+  - `GET /mock/events` showed exactly two events landed with the correct
+    shape: `solved` (`points: 920` = `1000 - 8*10`, `risk: 8`,
+    `team_id: "TEAM1"` — our own team_code, unmapped) and `output_issued`
+    (`meta.value: "AA33-FB43"`).
+  - Set the mock's `compromised_nodes` to `["N15"]` via `/mock/set_state`,
+    resubmitted the same previously-accepted route (passes through N15)
+    -> rejected `"N15 is compromised"` — confirms the gateway's
+    compromised-node list genuinely merges into submission validation,
+    not just stored and ignored. Cleared it, resubmitted -> accepted
+    again.
+  - **Gateway-down test**: killed the mock mid-test, submitted a
+    different route -> **still accepted** (11ms, no blocking on the
+    unreachable gateway — connection was refused immediately, didn't
+    need to wait out the 3s timeout in this case), `"budget": 99.0`
+    confirms correct fallback to `BUDGET_DEFAULT` once `get_team_state`
+    returned `None`. Queried the `gateway_outbox` table directly —
+    confirmed the `solved` event was genuinely queued (`attempts: 2`,
+    since both the inline send attempt and one drain-thread retry had
+    already run and failed). Restarted the mock, waited one drain
+    interval (~7s) -> `GET /mock/events` showed the queued event had
+    landed with its *original* `event_id`, outbox confirmed empty (0
+    pending) — full down/queue/recover/drain cycle verified end-to-end,
+    not just read from the code.
+  - Route-code determinism (direct unit-level check, not via the
+    server): same team/route/risk called twice -> identical code both
+    times; different team, different route, and different risk each
+    independently produced a different code; format confirmed
+    `XXXX-XXXX` (9 chars, dash at index 4).
+  - **No-gateway-configured test**: started the real server with
+    `GATEWAY_BASE_URL`/`GATEWAY_API_KEY` both unset — submission still
+    worked, `"budget": 100.0"` (the plain `BUDGET_DEFAULT` fallback,
+    identical to pre-integration behavior) — confirms local dev without
+    any gateway setup is unaffected.
+  - **Real browser verification** (agent-browser, same workflow as the
+    2026-10-01 verification sessions): opened `/team`, logged in as
+    TEAM1 (who already had a best valid route from the API tests above),
+    confirmed the Route Code panel **renders on page load** (not just
+    right after a fresh submission) showing the exact same code
+    (`AA33-FB43`) the API test produced — screenshot
+    `09-team-route-code-on-load.png` in
+    `brain/verification-screenshots/`. Amber-bordered panel, large
+    readable monospace code, correct placement above the graph, no
+    layout issues.
+  - Re-ran `solver.py`'s self-check after all changes — still passes,
+    confirms this session didn't touch the validation/scoring core.
+  - Cleaned up: closed the browser, killed both the mock gateway and the
+    real test server, deleted the test `game.db`.
+- **What's still open with the gateway owner** (flagging explicitly, per
+  the instruction):
+  - **Points formula**: `max(0, 1000 - risk*10)` is a placeholder I
+    invented to have *something* non-zero and risk-sensitive to send —
+    the spec asks us to reply with "points formula, max points" (§7.2),
+    it doesn't hand us one. Needs a real answer before the event; the
+    `solved` events we're sending right now carry made-up numbers.
+  - **`wrong_attempt`**: NOT implemented/sent yet, on purpose. The spec
+    is explicit for p2g1 ("each wrong key: send wrong_attempt") and p2g3
+    ("each wrong token/endpoint submission: send wrong_attempt") but says
+    nothing about it for p2g4 specifically in §4's entry for us — and a
+    "wrong attempt" at a route-planning game (closed edge? wrong
+    node? budget exceeded? these are pretty different from "wrong
+    password") doesn't obviously map the same way. Built the capability
+    behind `SEND_WRONG_ATTEMPTS` (default `false`, one-line flip once
+    confirmed) rather than guessing and shipping it live.
+  - Everything else from spec §7's questionnaire (stack/hosting,
+    multiple-submissions-which-counts [already answered: best valid =
+    lowest risk, matches what we built], anything we need to read
+    [confirmed: balance + compromised_nodes, both wired]) is already
+    covered by what's built — no other open questions from our side.
+- What's broken / left for next session:
+  - Nothing known-broken from what was tested against the mock.
+  - **Not tested against the real gateway** — can't be, the real base
+    URL/API key/test team T00 aren't shared yet (spec §6). Do this as
+    soon as those are available: point `GATEWAY_BASE_URL`/
+    `GATEWAY_API_KEY` at the real values and re-run (at minimum) the
+    submission + outbox-retry tests above against the real thing, since
+    a mock can only prove our side of the contract, not the real
+    gateway's actual behavior.
+  - `GATEWAY_BASE_URL`/`GATEWAY_API_KEY` currently empty by default
+    (no-op mode) — same "must be set deliberately before the event"
+    caveat as `ADMIN_TOKEN`/`BUDGET_DEFAULT`/`INTEGRATION_KEYS`.
+  - The old `/api/integration/*` endpoints are still live and untouched
+    — worth a decision later on when it's actually safe to remove them
+    (once confirmed no other game still depends on them).
+  - Admin panel (`admin.html`) has no visibility into the outbox queue
+    depth or gateway connectivity — would be useful for organizers to
+    see "N events queued, gateway last reachable at X" during the event,
+    not built this session (not asked for).
+
+## 2026-10-01 (Claude Code — fix: history table route-column overflow)
+- **Fixed the one real bug flagged by the agent-browser verification
+  session above**: `game/templates/team.html`'s submission-history table
+  clipped long routes in the ROUTE column and overlapped the RISK column
+  (confirmed visually in `06-team-route-rejected-budget.png` and
+  `07-team-route-accepted.png`, 7-hop route rendered as
+  `N00 → N03 → ... → N!`).
+- **Root cause**: the table used default `table-layout: auto` with only
+  `max-width`/`overflow-x: auto`/`white-space: nowrap` on the `.route-cell`
+  — under auto layout, a `max-width` on a `td` doesn't actually constrain
+  column width (columns size to content first), so the cell was free to
+  grow past its visual column and overlap the next one; the intended
+  `overflow-x` scrollbar never had a fixed box to scroll within.
+- **Fix** (`game/templates/team.html`): switched `#history-table` to
+  `table-layout: fixed` with explicit pixel widths on the #/Status/Risk/
+  Event-T columns (28px/90px/55px/70px), leaving the Route column to take
+  the remaining space automatically. Changed `.route-cell` from
+  `white-space: nowrap` + horizontal scroll to `white-space: normal` +
+  `word-break: break-word` — **routes now wrap onto multiple lines within
+  their own cell** rather than scrolling or truncating. Chose wrap over a
+  hover/click-to-expand: a team's own just-submitted route is exactly what
+  they want to glance-check in a noisy event hall, and hiding it behind an
+  interaction is worse UX than letting the cell grow taller.
+- **Verified against the real rendered page**, not just the CSS source —
+  re-ran the same agent-browser workflow from the verification session:
+  fresh server, `/team`, logged in as TEAM1, submitted the **exact same
+  7-hop route that exposed the original bug**
+  (`N00,N03,N04,N05,N06,N07,N59`) plus the known-good accepted route, to
+  reproduce the original two-row screenshot layout.
+  - `08-team-history-route-wrap-fixed.png` — the 7-hop rejected route now
+    wraps cleanly onto two lines inside the ROUTE cell, RISK column still
+    shows `—` with no overlap, table stays aligned at normal width.
+  - Stress-tested further with an 8-hop route
+    (`N00,N01,N02,N03,N04,N05,N06,N07,N59`, found via the same
+    brute-force + `validate_path` search approach as the original bug
+    repro) — wraps correctly across two lines, three-row table still
+    intact, no regression (screenshot taken to `/tmp`, not kept —
+    transient check, the 7-hop case above is the one that matters since
+    it's the documented repro).
+  - Checked at mobile width (390×844 via `agent-browser set viewport`)
+    per the project's responsive requirement — route wraps one node per
+    line at that width, stays fully inside its column, no horizontal
+    scroll, no breakage.
+  - `agent-browser console` after all of the above: zero errors/warnings.
+  - Cleaned up: closed the browser, killed the test server, deleted the
+    test `game.db`.
+- What's broken / left for next session: nothing known-broken. This
+  closes out the one open item from the prior verification session.
+
+## 2026-10-01 (Claude Code — real browser verification via agent-browser)
+- **This finally closes the open item flagged in every frontend session
+  since 2026-09-28**: "Claude-in-Chrome not connected, no real
+  click-through happened." Installed and used `agent-browser`
+  (https://github.com/vercel-labs/agent-browser, Rust CLI, drives a real
+  headless Chrome for Testing instance) instead — `npm install -g
+  agent-browser && agent-browser install` (downloaded Chrome 154.0.8037.92
+  for mac-arm64, ~182MB, one-time). This is a genuinely different/working
+  path from the Claude-in-Chrome extension dependency that was blocked all
+  prior sessions.
+- **Setup**: fresh `game.db`, real server (`ADMIN_TOKEN=test-token
+  BUDGET_DEFAULT=25 INTEGRATION_KEYS=game3:g3key`, port 5050, via the
+  project's `.venv`). Chose `BUDGET_DEFAULT=25` deliberately so both an
+  acceptable route (cost=22) and a clean over-budget rejection (found a
+  real, open-at-t=0 route costing 33 via brute-force DFS + `validate_path`
+  filtering, not guessed) were reachable in the same session.
+- **Workflow used**: `open` -> `snapshot` (accessibility tree with `@eN`
+  refs) -> `fill`/`click` by ref -> `screenshot`. All 8 screenshots saved
+  to new `brain/verification-screenshots/`.
+- **Real bug in my own test process, not the app**: the node-compromise
+  grid re-renders its DOM on every toggle click, which invalidates every
+  `@eN` ref from a prior snapshot — clicking a stale ref after a re-render
+  silently hits whatever element now occupies that ref number. First
+  attempt at toggling N15 compromised this way actually toggled N03, then
+  N13, before landing on N15 correctly. **Lesson for next time**: take a
+  fresh `snapshot` immediately before every single click on a
+  dynamically-re-rendering list, don't batch clicks against one cached
+  snapshot. Verified the final compromised-state via `GET /api/graph`
+  (`compromised_nodes: ["N15"]`) before trusting the screenshot, so the
+  actual result captured is correct — this was a process hiccup during
+  the session, not a reported bug in the app itself.
+- **What was verified and what the screenshots actually show**:
+  1. `01-admin-login.png` — `/admin` on load: dark panel, token input,
+     "Enter" button. Clean, legible, no layout issues.
+  2. `02-admin-logged-in.png` — after filling the real token and clicking
+     Enter: full panel renders (event clock, global compromise grid,
+     per-team compromise controls). Good contrast throughout.
+  3. `03-admin-clock-set-60.png` — filled `60` into the minute field,
+     clicked "Set clock to this minute": **the on-screen `t = X.XX min`
+     readout actually changed from `0.00` to `60.00` live, no reload** —
+     confirms the UI genuinely reflects server state, not just that the
+     API call succeeded underneath.
+  4. `04-admin-node-compromised.png` — N15 clicked compromised (after
+     correcting the stale-ref mistake above): **N15 renders with a
+     distinct red highlight** against the other (unstyled) node chips,
+     clearly visible, matches `compromised_nodes` from the live API.
+  5. `05-team-graph-view.png` / `05b-...-downloads-and-form.png` —
+     `/team`, logged in as TEAM1: vis-network graph actually renders (not
+     just the fallback text notice) — 60 nodes, edges, hideout (green,
+     N00) and extraction (red, N59) correctly colored per the legend,
+     closed-now edges visibly faded vs. open ones. Download links
+     (`⇩ graph.json`, `⇩ graph.csv`) and the submission form both render
+     correctly below the graph. Money Heist theme (near-black bg, red/
+     amber accents, Oswald/IBM Plex Mono fonts per the 2026-09-30 entry)
+     renders as designed — legible, no contrast problems at this
+     resolution.
+  6. `06-team-route-rejected-budget.png` — submitted the real over-budget
+     route (`N00,N03,N04,N05,N06,N07,N59`, cost=33 > budget=25): red-
+     bordered panel, headline "BLOWN — ROUTE REJECTED", and the literal
+     reason string `total cost 33 exceeds budget 25.0` rendered verbatim
+     underneath — confirms the new budget-cap rejection path (added this
+     session, see the entry above) actually reaches the browser correctly
+     end-to-end, not just via curl.
+  7. `07-team-route-accepted.png` — submitted the known-good route
+     (`N00,N15,N30,N45,N59`, risk=8, fits budget=25): green-bordered
+     panel, "JOB'S DONE — ROUTE ACCEPTED", three stat tiles **TIME 35 /
+     RISK (SCORE) 8 / COST 22** (confirms the risk-only scoring rework
+     from this session renders with the right label and right number,
+     not leftover `score` text), "New personal best" badge, and the
+     history table below updated with both the accepted and earlier
+     rejected rows.
+- **Real visual bug found** (not a process mistake, an actual rendering
+  issue in `team.html`): **the submission-history table's ROUTE column
+  clips long route strings** — the 7-node rejected route renders as
+  `N00 → N03 → N04 → N05 → N06 → N07 → N!` with the tail cut off and
+  overlapping into the RISK column (visible in both `06-...` and
+  `07-...` screenshots, same row). Short routes (the 5-node accepted one)
+  render fine. The column has no wrap/truncate-with-ellipsis handling for
+  long content — worth a fix (e.g. `white-space: normal` + word-wrap, or
+  truncate with `…` and a tooltip) before the event, since event routes
+  could easily run longer than 7 hops. **Not fixed this session** — this
+  task was verification-only, flagging for a follow-up.
+- **Console check**: `agent-browser console` on both `/admin` and `/team`
+  after full interaction (login, clock set, node toggle, two route
+  submissions, graph render) — **zero console output on either page**, no
+  errors/warnings/logs. Clean.
+- **Not covered this session** (out of scope for the 8-step verification
+  asked for, flagging so it's not assumed done): mobile/narrow-width
+  rendering, the admin panel's per-team compromise UI interaction (only
+  the global grid was exercised), the leaderboard/submissions-log/export
+  sections of the admin panel, and the team page's history-table
+  ACCEPTED/REJECTED pill styling wasn't zoomed in on for contrast beyond
+  what's visible in the full-page screenshots above.
+- Cleaned up: closed the agent-browser session, killed the test server,
+  deleted the test `game.db`.
+- What's broken / left for next session:
+  - ~~Fix the history-table route-column text overflow in `team.html`~~ —
+    **fixed and re-verified in the very next session, see the entry
+    above this one** (dated the same day, appears above in the log since
+    newest entries sort to the top).
+  - Still not covered: admin per-team-compromise UI click-through,
+    leaderboard/export sections visually (mobile-width was spot-checked
+    in the fix-verification session above, at least for the team page).
+    Recommend extending this same agent-browser approach rather than
+    reverting to manual browser testing, now that it's proven to work in
+    this environment.
+
+## 2026-10-01 (Claude Code — scoring model rework: risk-only + hard caps)
+- **Scope addition, confirmed by Rudra**: the weighted-sum score
+  (time*1.0 + risk*4.0 + cost*0.5) is replaced. New model: minimize RISK
+  only, subject to two hard constraints — total time <= the event's
+  deadline AND total cost <= the submitting team's budget. A route that
+  breaks either cap is REJECTED outright (same as a closed edge or
+  compromised node), not penalized in a score. All milestones 1-4 were
+  already done/tested before this session; this is a core-model change on
+  top of that, not a new milestone.
+- **Why plain Dijkstra can't do this**: minimizing a single weighted sum
+  (the old model) can silently let a cheap detour's risk/time "buy down"
+  an otherwise-bad cost, and minimizing risk alone ignores the caps
+  entirely. A route that's worse on risk might be the *only* one that
+  fits the budget — need the actual min-risk route among only the
+  feasible-under-both-caps routes.
+- **`game/solver.py`**:
+  - `validate_path()` (still the single source of truth app.py imports)
+    gained optional `deadline=`/`budget=` kwargs. When given, it now also
+    checks `total_time <= deadline` and `total_cost <= budget` after
+    confirming the route is real/open/uncompromised, returning the exact
+    reason string (`"total cost 22 exceeds budget 10.0"` /
+    `"total time 35 exceeds deadline 20"`) consistent with its existing
+    reason-string style.
+  - New `min_risk_constrained(graph, start, goal, *, t, compromised,
+    deadline, budget)` — the actual constrained solver. State-augmented
+    best-first search over `(node, cumulative_cost)`, tracking
+    Pareto-minimal `(risk, time)` pairs per state (neither dominates the
+    other, so both are kept unless one state beats another on both axes).
+    No bucketing/discretization needed: edge time/cost are small
+    non-negative integers in this graph (time 1-15, cost 1-20 per edge,
+    176 edges) and budget/deadline are themselves finite integers, so
+    cumulative cost has at most `budget+1` exact integer values to track —
+    exact DP, not an approximation. Over-budget/over-deadline partial
+    paths are pruned immediately, not explored.
+  - Self-check (`run_selfcheck`) extended to prove, on top of the existing
+    shortest-time-vs-best-score trap: (a) the graph is solvable under a
+    generous deadline/budget combo, and the constrained solver's own route
+    round-trips through `validate_path()`; (b) scans budgets between the
+    fastest-by-time route's cost and the (old) best-by-score route's cost
+    to find one where `min_risk_constrained` returns a route that's
+    genuinely different from the fastest-by-time route AND has strictly
+    lower risk — proving the constrained model surfaces something plain
+    Dijkstra-by-time structurally cannot. Scanning a budget range rather
+    than a fixed offset, because a hardcoded offset (tried `+6` first)
+    turned out to be specific to seed 42's graph and failed on other
+    seeds (1, 3, 99) — re-verified passing on seeds 1/2/3/42/99/1000 after
+    the fix.
+  - Found and fixed a transient issue while building this: at `t=0` the
+    low-risk alternate route uses an edge (`N15->N58`, window 59-112)
+    that isn't open yet — this is correct behavior (the solver respects
+    live windows), not a bug; the self-check now uses `t=None` for the
+    constrained-model proof specifically because it's testing the
+    solver's constraint logic in isolation, not replaying the live clock.
+- **`game/budget.py` (new)**: `get_team_budget(team_code)` — currently
+  returns one shared default from `BUDGET_DEFAULT` env var (default 100).
+  Written so the planned swap to a real call to the central cross-game
+  dashboard (still being built elsewhere, same pattern as the
+  `INTEGRATION_KEYS` gateway possibility noted in the 2026-09-29 entry) is
+  a one-line change inside this one function — nothing else in the
+  codebase (solver.py, app.py, or any future caller) needs to change when
+  that swap happens.
+- **Deadline**: stayed as `graph.json["event_duration"]` (already existed,
+  120 minutes) rather than adding a new field — it was already exactly
+  "total time cap for the whole event," so reused as-is.
+- **`game/app.py`**:
+  - `/api/submit_route`: now calls `validate_path(..., deadline=
+    GRAPH["event_duration"], budget=get_team_budget(team_code))`. Score
+    stored/returned is now `risk_total` directly (lower = better, same
+    direction as before). Response echoes `deadline`/`budget` alongside
+    the existing fields so a team can see what they were actually
+    measured against, not just the rejection reason text.
+  - **Breaking change** (as instructed) to response shapes:
+    `/api/leaderboard`, `/api/integration/leaderboard`, and
+    `/api/integration/result/<team_code>` no longer return a combined
+    `score`/`best_score` field — they return `risk`/`time`/`cost`/
+    `budget`/`deadline`/`has_valid_route` instead, via a new shared
+    `_team_summary()` helper (leaderboard and integration-leaderboard were
+    duplicating the same per-team lookup, now both call it). Documented
+    in brain/API-CONTRACT.md's responsibility — **the other four games'
+    developers integrating against `/api/integration/*` need to update
+    their field reads** (`best_score` -> `risk`); flagging here since
+    that contract doc exists specifically for them.
+  - `admin_export`/`admin_export.csv` and `/api/admin/submissions` were
+    NOT changed — they read the DB row's `score` column directly, which
+    now holds the risk value under the hood, so they keep working without
+    code changes, just a now-slightly-stale field *name* (not worth
+    touching, out of scope for this session).
+  - Removed the now-meaningless `weights` field from `/api/graph`'s
+    response (there's no weighted sum anymore) and the unused `WEIGHTS`
+    module global.
+- **Frontend fixes** (not explicitly in scope, but the breaking response
+  changes above would have silently broken these on load — fixed as the
+  root-cause follow-through, not deferred):
+  - `admin.html`'s leaderboard renderer read `row.best_score` (now
+    `undefined.toFixed` crash) — fixed to read `row.risk`, header relabeled
+    "Best (lowest) risk".
+  - `team.html`'s result panel rendered a `b.score` stat tile from
+    `/api/submit_route`'s breakdown, which no longer has that key — removed
+    the tile (risk is already shown and IS the score now). History table's
+    "Score" column header relabeled "Risk" (the underlying field, `r.score`
+    from `/api/team/<code>/history`, is unchanged — that endpoint reads the
+    DB column directly, still populated).
+- **Tested against the real server** (fresh `game.db`, port 5050):
+  - `ADMIN_TOKEN=test-token BUDGET_DEFAULT=100`: submitted the cheap/risky
+    route (cost=8, risk=57) -> accepted, `is_new_best: true`. Submitted the
+    low-risk route (cost=22, risk=8) -> accepted, `is_new_best: true`
+    (risk 8 < 57 — confirms best-tracking now compares risk, not the old
+    score).
+  - `BUDGET_DEFAULT=10` (restart, fresh db): the cost=22 low-risk route ->
+    rejected, `"total cost 22 exceeds budget 10.0"`. The cost=8 risky
+    route -> still accepted. Confirms a route can be rejected purely for
+    cost even though it's the better route on every other axis — the
+    actual breaking-change behavior requested.
+  - Deadline rejection verified directly via `validate_path(... ,
+    deadline=20, budget=100)` on the cost=22/time=35 route -> rejected,
+    `"total time 35 exceeds deadline 20"`.
+  - `/api/leaderboard` (admin token), `/api/integration/leaderboard`, and
+    `/api/integration/result/TEAM1` (dev game key) all confirmed returning
+    `risk`/`time`/`cost`/`budget`/`deadline`/`has_valid_route`, no
+    `score`/`best_score` anywhere.
+  - Re-ran `solver.py`'s self-check standalone and across seeds
+    1/2/3/42/99/1000 — all pass.
+  - Cleaned up: killed the test server, deleted the test `game.db`.
+- What's broken / left for next session:
+  - Nothing known-broken from what was tested.
+  - `brain/API-CONTRACT.md` was NOT updated this session to reflect the
+    `/api/integration/*` field changes (`best_score` -> `risk` etc.) —
+    **do this before telling the other four games' developers**, since
+    that doc is their only reference and is now stale on this point.
+  - No actual browser click-through of the frontend fixes above (same
+    long-standing Claude-in-Chrome-not-connected caveat as every prior
+    frontend session) — the JS was read/patched against the real response
+    shapes, not click-tested in a live browser.
+  - `BUDGET_DEFAULT` env var currently defaults to 100 if unset — same
+    "must be set deliberately before the event" caveat as `ADMIN_TOKEN`/
+    `INTEGRATION_KEYS`: confirm the real default (or per-team values, once
+    the dashboard swap lands) before the live event, don't ship an
+    arbitrary placeholder number live.
+
 ## 2026-09-30 (Claude Code — Milestone 4: team frontend)
 - Milestone 4 DONE: team-facing frontend, `game/templates/team.html`, served
   by new `GET /team` in `game/app.py`. No frontend framework/build step —

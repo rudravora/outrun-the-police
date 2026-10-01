@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS submissions (
     cost_total REAL,
     score REAL,
     submitted_at REAL NOT NULL,
-    event_t REAL NOT NULL
+    event_t REAL NOT NULL,
+    route_code TEXT
 );
 
 CREATE TABLE IF NOT EXISTS compromised_nodes (
@@ -49,6 +50,16 @@ CREATE TABLE IF NOT EXISTS event_clock (
     running INTEGER NOT NULL,
     started_at REAL,
     updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gateway_outbox (
+    event_id TEXT PRIMARY KEY,
+    body_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    delivered INTEGER NOT NULL DEFAULT 0,
+    delivered_at REAL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at REAL
 );
 """
 
@@ -138,6 +149,66 @@ def get_all_team_compromised(conn=None):
     if close:
         conn.close()
     return [dict(r) for r in rows]
+
+
+def outbox_enqueue(event_id, body_json, conn=None):
+    """Queue a gateway event body (already-serialized JSON string) for later
+    delivery — used when a live POST to the gateway fails. INSERT OR IGNORE
+    so re-enqueuing the same event_id (e.g. a retried call site) is a no-op,
+    matching the gateway's own event_id idempotency."""
+    close = conn is None
+    conn = conn or get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO gateway_outbox (event_id, body_json, created_at, delivered) "
+        "VALUES (?, ?, ?, 0)",
+        (event_id, body_json, time.time()),
+    )
+    conn.commit()
+    if close:
+        conn.close()
+
+
+def outbox_pending(conn=None):
+    """Undelivered outbox events, oldest first."""
+    close = conn is None
+    conn = conn or get_conn()
+    rows = conn.execute(
+        "SELECT event_id, body_json, attempts FROM gateway_outbox "
+        "WHERE delivered = 0 ORDER BY created_at ASC"
+    ).fetchall()
+    if close:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def outbox_mark_delivered(event_id, conn=None):
+    close = conn is None
+    conn = conn or get_conn()
+    now = time.time()
+    conn.execute(
+        "UPDATE gateway_outbox SET delivered = 1, delivered_at = ?, "
+        "attempts = attempts + 1, last_attempt_at = ? WHERE event_id = ?",
+        (now, now, event_id),
+    )
+    conn.commit()
+    if close:
+        conn.close()
+
+
+def outbox_mark_attempt(event_id, conn=None):
+    """Record a failed retry attempt without marking delivered — keeps it
+    queued for the next drain cycle."""
+    close = conn is None
+    conn = conn or get_conn()
+    now = time.time()
+    conn.execute(
+        "UPDATE gateway_outbox SET attempts = attempts + 1, last_attempt_at = ? "
+        "WHERE event_id = ?",
+        (now, event_id),
+    )
+    conn.commit()
+    if close:
+        conn.close()
 
 
 if __name__ == "__main__":
