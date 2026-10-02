@@ -103,12 +103,17 @@ def path_score(edges, weights):
     return weights["time"] * tot["time"] + weights["risk"] * tot["risk"] + weights["cost"] * tot["cost"]
 
 
-def validate_path(graph, node_path, *, t, compromised):
+def validate_path(graph, node_path, *, t, compromised, deadline=None, budget=None):
     """
     Server-side validator: given an ordered list of node IDs, the current
     event time t, and the set of currently-compromised node IDs, checks the
     path is a real sequence of currently-open edges through non-compromised
-    nodes. Returns (ok: bool, reason: str, edges: list|None).
+    nodes, AND (if given) that total time <= deadline and total cost <=
+    budget. Returns (ok: bool, reason: str, edges: list|None).
+
+    A route that exceeds deadline or budget is REJECTED outright, not
+    penalized in a score — risk is the only thing scored now
+    (see min_risk_constrained below).
 
     This is the exact logic the live Flask backend must reuse for
     submission validation (see PRD 8.4 — never trust client-computed score).
@@ -140,7 +145,94 @@ def validate_path(graph, node_path, *, t, compromised):
             return False, f"edge {u}->{v} not open at t={t}", None
         edges.append(open_candidates[0])
 
+    totals = path_totals(edges)
+    if deadline is not None and totals["time"] > deadline:
+        return False, f"total time {totals['time']} exceeds deadline {deadline}", None
+    if budget is not None and totals["cost"] > budget:
+        return False, f"total cost {totals['cost']} exceeds budget {budget}", None
+
     return True, "ok", edges
+
+
+def min_risk_constrained(graph, start, goal, *, t=None, compromised=None, deadline, budget):
+    """
+    Finds the minimum-RISK route from start to goal subject to:
+      total time  <= deadline
+      total cost  <= budget
+      (plus the usual open-edge-at-t / not-compromised constraints).
+
+    Plain Dijkstra can't do this: minimizing risk alone would ignore the
+    caps, and minimizing a weighted sum (the old model) can silently accept
+    a route that blows the budget as long as risk/time compensate. Needed:
+    a route that's worse on risk than some other route, but is the only one
+    that actually fits the caps.
+
+    Approach: state-augmented DP over (node, cumulative_cost). Edge time/
+    cost are small non-negative integers (checked by run_selfcheck), and
+    `deadline`/`budget` are themselves finite, so cumulative cost has at
+    most `budget + 1` distinct integer values worth tracking (any path
+    using more than `budget` cost is already invalid, so it's pruned, not
+    bucketed/approximated). For each (node, cost_used) pair we track the
+    minimum (risk, time) to reach it; time is folded into the same state
+    scan rather than given its own axis, since at fixed cost the only thing
+    that matters for deadline-feasibility is minimizing time too — we keep
+    the Pareto-minimal (risk, time) pairs per (node, cost) state instead of
+    just one, since neither dominates the other.
+
+    Returns (edges, totals) for the best feasible route, or (None, None) if
+    no route satisfies both caps.
+    """
+    compromised = compromised or set()
+    adj = build_adjacency(graph)
+    budget_i = int(budget)
+
+    best_at_goal = None  # (risk, time, edges)
+
+    # Simple best-first search over (risk, time) ordered by risk, since
+    # that's what we minimize; budget/time act as hard filters per edge.
+    pq = [(0, 0, start, 0, [])]  # (risk, time, node, cost_used, edges)
+    visited_best = {}  # (node, cost_used) -> list of (risk, time) kept
+
+    def dominated(node, cost_used, risk, time_):
+        for r, tm in visited_best.get((node, cost_used), []):
+            if r <= risk and tm <= time_:
+                return True
+        return False
+
+    while pq:
+        risk, time_, u, cost_used, edges = heapq.heappop(pq)
+
+        if dominated(u, cost_used, risk, time_):
+            continue
+        visited_best.setdefault((u, cost_used), []).append((risk, time_))
+
+        if u == goal:
+            if best_at_goal is None or risk < best_at_goal[0]:
+                best_at_goal = (risk, time_, edges)
+            continue
+
+        for e in adj[u]:
+            v = e["to"]
+            if v in compromised:
+                continue
+            if t is not None and not (e["window_start"] <= t <= e["window_end"]):
+                continue
+            new_cost = cost_used + e["cost"]
+            if new_cost > budget_i:
+                continue
+            new_time = time_ + e["time"]
+            if new_time > deadline:
+                continue
+            new_risk = risk + e["risk"]
+            if dominated(v, new_cost, new_risk, new_time):
+                continue
+            heapq.heappush(pq, (new_risk, new_time, v, new_cost, edges + [e]))
+
+    if best_at_goal is None:
+        return None, None
+
+    risk, time_, edges = best_at_goal
+    return edges, path_totals(edges)
 
 
 def run_selfcheck(graph):
@@ -186,11 +278,54 @@ def run_selfcheck(graph):
     ok, reason, _ = validate_path(graph, t_nodes, t=0, compromised={mid_node})
     assert not ok, "compromised node should invalidate a route but didn't"
 
+    # --- Constrained model (risk-only objective, hard time/cost caps) ---
+    deadline = graph["event_duration"]
+    fastest_totals = path_totals(t_edges)
+
+    # (a) solvable under a reasonable deadline/budget combination.
+    budget = fastest_totals["cost"] + 50  # generous, just proving feasibility
+    c_edges, c_totals = min_risk_constrained(
+        graph, hideout, extraction, t=0, compromised=set(), deadline=deadline, budget=budget
+    )
+    assert c_edges is not None, "graph not solvable under constrained model at t=0 — generator/solver bug"
+    ok, reason, _ = validate_path(
+        graph, [hideout] + [e["to"] for e in c_edges], t=0, compromised=set(),
+        deadline=deadline, budget=budget,
+    )
+    assert ok, f"constrained solver's own route failed validate_path: {reason}"
+
+    # (b) min-TIME route and min-RISK-under-caps route genuinely differ,
+    # proving the min-time route is NOT always what should be accepted as
+    # "best". We already know the best-by-score route (lower risk, higher
+    # cost than fastest) is feasible under its own cost — scan budgets
+    # between fastest's cost and that cost to find one where the
+    # risk-minimizer picks a genuinely different, lower-risk route than
+    # fastest-by-time (plain Dijkstra-by-time would never surface it).
+    best_score_cost = path_totals(s_edges)["cost"]
+    mid_edges = mid_totals = mid_budget = None
+    for b in range(int(fastest_totals["cost"]), int(best_score_cost) + 1):
+        edges, totals = min_risk_constrained(
+            graph, hideout, extraction, t=None, compromised=set(), deadline=deadline, budget=b
+        )
+        if edges is None:
+            continue
+        nodes = [hideout] + [e["to"] for e in edges]
+        if nodes != t_nodes and totals["risk"] < fastest_totals["risk"]:
+            mid_edges, mid_totals, mid_budget = edges, totals, b
+            break
+    assert mid_edges is not None, (
+        "expected some budget between the fastest route's cost and the best-score route's "
+        "cost to yield a genuinely different, lower-risk route than fastest-by-time"
+    )
+    mid_nodes = [hideout] + [e["to"] for e in mid_edges]
+
     return {
         "fastest": {"nodes": t_nodes, "time": fastest_time, "score": fastest_score,
                     "totals": path_totals(t_edges)},
         "best_score": {"nodes": s_nodes, "time": best_score_route_time, "score": best_score_route_score,
                         "totals": path_totals(s_edges)},
+        "constrained": {"nodes": mid_nodes, "totals": mid_totals, "budget": mid_budget,
+                         "deadline": deadline},
     }
 
 
@@ -209,3 +344,11 @@ if __name__ == "__main__":
           f"score={result['best_score']['score']:.1f}")
     print()
     print("TRAP CONFIRMED: fastest route is NOT the best-scoring route.")
+    print()
+    c = result["constrained"]
+    print(f"Min-risk route under budget={c['budget']}, deadline={c['deadline']} "
+          f"({len(c['nodes'])} nodes):")
+    print("  ", " -> ".join(c["nodes"]))
+    print(f"   totals={c['totals']}")
+    print("CONSTRAINED MODEL CONFIRMED: min-risk-under-caps route differs from the "
+          "fastest-by-time route and has strictly lower risk.")

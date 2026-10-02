@@ -1,177 +1,104 @@
 # Deployment — Outrun the Police
 
-## Chosen host
+This app is a plain Flask process backed by a SQLite file on disk, plus a
+background thread that retries queued gateway events every
+`GATEWAY_DRAIN_INTERVAL` seconds. Both of those need a host that runs it as
+a normal persistent process with a normal filesystem — not a serverless
+platform (see the note at the bottom on why Vercel-style hosting doesn't
+fit this app without real rework).
 
-Railway is the deployment target for the current SQLite-backed implementation.
+Render and Railway both fit as-is. Instructions below cover Render first
+(a ready `render.yaml` is included), then Railway as the alternative, then
+the laptop-as-LAN-server fallback for event day if hosting has issues.
 
-The application writes its database to `game/game.db`. Railway Volumes provide
-persistent storage across deployments and restarts, so the volume is mounted at
-`/data` and `deploy/start.sh` links `game/game.db` to `/data/game.db`.
+## Environment variables
 
-Do not mount the volume at `/app/game`: that directory contains the application
-code. The persistent volume is intentionally mounted separately.
+| Variable | Required? | What it does if unset |
+|---|---|---|
+| `ADMIN_TOKEN` | **Yes, before going live** | Defaults to `dev-admin-token` — anyone could hit the admin endpoints. Set a real secret. |
+| `GATEWAY_BASE_URL` | Set once the organizer shares it | Gateway integration runs in no-op mode: budget/compromise reads just use local fallbacks, nothing is sent out. Safe default for testing, wrong for event day. |
+| `GATEWAY_API_KEY` | Set once the organizer shares it | Same no-op behavior as above. |
+| `GATEWAY_DRAIN_INTERVAL` | No | Defaults to 15 (seconds between outbox retries). |
+| `BUDGET_DEFAULT` | Recommended | Fallback cost budget used when the gateway is unreachable/unconfigured. Pick a real number before the event, not whatever default is in the code. |
+| `INTEGRATION_KEYS` | Only if another game still calls our old `/api/integration/*` endpoints directly | Format `game3:key1,game5:key2`. Leave unset once everyone's migrated to the central gateway. |
+| `DB_PATH` | Only matters on a host without a persistent disk mounted — see below | Defaults to a file inside the repo checkout. |
+| `PORT` | No | Set automatically by Render/Railway. Only needed manually for the laptop fallback. |
+| `FLASK_DEBUG` | No | Leave unset in production. Set to `1` for local dev if you want the reloader. |
 
-## Repository layout
+## Option A — Render (recommended, `render.yaml` included)
 
-The deployment expects this structure:
+1. Push this repo to GitHub (already done).
+2. In the Render dashboard: **New → Blueprint**, point it at this repo. It
+   reads `render.yaml` automatically and creates the web service plus a
+   1GB persistent disk mounted at `/data`.
+3. **This uses the `starter` plan (~$7/month), not free** — deliberately.
+   Render's free tier has **no persistent disk**, and this app's whole
+   state (teams, submissions, compromised nodes, the gateway outbox) is a
+   SQLite file on disk. On free tier, every redeploy *and every spin-down
+   restart* silently resets that file to empty. For a one-off dry run
+   that's merely annoying; **for the live event, that's a team's entire
+   progress wiped mid-game** — not worth the ~$7 saving. If you want to
+   test without paying first, delete the `disk:` block and change
+   `plan: starter` to `plan: free` in `render.yaml` — just don't use that
+   config on event day.
+4. In the Render dashboard, set `ADMIN_TOKEN`, `BUDGET_DEFAULT`, and
+   (once you have them from the organizer) `GATEWAY_BASE_URL` /
+   `GATEWAY_API_KEY` — these are listed with `sync: false` in
+   `render.yaml` on purpose, so they're entered once in the dashboard,
+   never committed to the repo.
+5. Deploy. Render gives you a `https://<name>.onrender.com` URL.
+6. Confirm end-to-end against the **hosted** instance, not just locally:
+   open `/admin`, log in, set the clock, mark a node compromised; open
+   `/team`, log in as a test team, submit a route, confirm it's
+   accepted/rejected correctly and the history/route-code panel renders.
 
-```text
-/
-├── Procfile
-├── requirements.txt
-├── deploy/
-│   └── start.sh
-├── game/
-│   ├── app.py
-│   ├── db.py
-│   ├── solver.py
-│   ├── graph.json
-│   └── templates/
-└── tests/
-```
+## Option B — Railway
 
-## Dependencies
+1. In the Railway dashboard: **New Project → Deploy from GitHub repo**,
+   pick this repo. Railway auto-detects the `Procfile`.
+2. Add a **volume**, mount it at `/data`. Railway volumes persist across
+   redeploys (same reason as Render's disk above).
+3. Set `DB_PATH=/data/game.db` plus the same env vars as the Render table
+   above, in Railway's Variables tab.
+4. Deploy, get the generated `https://<name>.up.railway.app` URL, run the
+   same end-to-end check as Render step 6.
 
-The root `requirements.txt` pins the production dependencies:
+## Option C — Laptop-as-venue-LAN-server fallback
 
-- Flask 3.1.3
-- Gunicorn 26.2.0
+If hosting has problems on event day, run it directly on a laptop
+connected to the venue WiFi, with teams hitting it by LAN IP:
 
-The existing `game/requirements.txt` can remain for local development.
+1. On the laptop: `cd game && pip install -r requirements.txt`
+2. Find the laptop's LAN IP (`ip addr` / `ifconfig` on Linux/Mac, `ipconfig`
+   on Windows) — e.g. `192.168.1.42`.
+3. Set the real env vars (`ADMIN_TOKEN`, `BUDGET_DEFAULT`, and
+   `GATEWAY_BASE_URL`/`GATEWAY_API_KEY` if the venue has internet to reach
+   the real gateway — if not, leave them unset and the app degrades to
+   local-fallback budgets with no gateway sends, per the no-op behavior
+   above).
+4. Run: `PORT=5050 python app.py`
+5. Teams on the same WiFi open `http://192.168.1.42:5050/team` in a
+   browser. Admin panel is the same host at `/admin`.
+6. **Test this path before the event, not during it** — confirm a second
+   device on the same WiFi can actually reach that URL (some venue WiFi
+   configs isolate devices from each other, which would break this
+   fallback silently).
 
-## Railway setup
+## Why not Vercel
 
-1. Create a Railway project and deploy the GitHub repository.
-2. Let Railway detect the Python application.
-3. Set the service start command to:
+Vercel runs this kind of app as stateless serverless functions with a
+read-only filesystem (except `/tmp`, which doesn't persist between
+invocations) — that breaks the SQLite-file-on-disk assumption this app
+relies on for state to survive a restart, and it doesn't support a
+long-lived background thread (the gateway outbox drain loop) sitting
+between requests. Making this Vercel-compatible would mean swapping
+SQLite for a hosted Postgres and replacing the drain thread with a
+scheduled Vercel Cron job — real rework, not a deploy setting. Render and
+Railway both run this as a normal persistent process, so nothing about the
+app needs to change.
 
-```text
-sh deploy/start.sh
-```
+## What's still not covered here
 
-The same command is also recorded in the root `Procfile`.
-4. Add the environment variable:
-
-```text
-ADMIN_TOKEN=<strong-random-secret>
-```
-
-Never commit the real admin token to Git.
-5. Attach a Railway Volume to the application service.
-6. Set the volume mount path to:
-
-```text
-/data
-```
-
-7. Keep the service at **one replica**. SQLite is a single-file database and the
-Railway volume is attached to one service instance.
-8. Generate a public Railway domain.
-9. Optionally configure a health check against:
-
-```text
-/api/graph
-```
-
-The endpoint is unauthenticated and returns the graph/event state.
-
-## First-deploy verification
-
-After deployment, verify:
-
-```text
-GET /api/graph
-```
-
-Then use the real admin token to verify:
-
-```text
-GET /api/leaderboard
-GET /api/admin/submissions
-GET /api/admin/export
-GET /api/admin/export.csv
-```
-
-Submit one known-valid test route:
-
-```json
-{
-  "team_code": "DEPLOY-TEST",
-  "route": ["N00", "N03", "N07", "N59"]
-}
-```
-
-The submission should be accepted.
-
-## Persistence verification
-
-Do not consider deployment complete until this test has been performed against
-the hosted service:
-
-1. Set the event clock to a known value through the admin endpoint.
-2. Submit a known-valid route.
-3. Compromise a node.
-4. Confirm the resulting state through the admin endpoints.
-5. Restart/redeploy the service.
-6. Confirm that the event clock, compromised node, submission, and leaderboard
-   state are still present.
-
-This verifies the Railway volume is actually being used by SQLite.
-
-## Production process
-
-Railway runs the Flask application through Gunicorn rather than Flask's
-development server:
-
-```text
-gunicorn --chdir game app:app
-```
-
-`deploy/start.sh` performs the SQLite-volume setup first and then starts
-Gunicorn.
-
-## SQLite / scaling constraint
-
-This deployment intentionally remains single-instance. Do not increase the
-service to multiple replicas while SQLite is the authoritative database.
-Multiple application instances must not independently own the same SQLite state.
-
-## Local fallback: venue LAN
-
-If the hosted service is unavailable on event day:
-
-1. Put the project on the designated venue laptop.
-2. Install the dependencies:
-
-```text
-pip install -r requirements.txt
-```
-
-3. Set the admin token in the environment.
-4. From the project root, start the Flask server:
-
-```text
-cd game
-python app.py
-```
-
-5. Connect the participating machines to the same venue LAN.
-6. Use the laptop's LAN IP with port `5050`.
-
-Example:
-
-```text
-http://192.168.x.x:5050
-```
-
-The exact LAN IP and firewall configuration must be checked on the venue
-machine before the event.
-
-## Security checklist
-
-- Use a strong random `ADMIN_TOKEN`.
-- Never commit `.env` files or real secrets.
-- Do not expose the SQLite file directly.
-- Verify that admin endpoints reject missing/incorrect tokens.
-- Verify the hosted admin panel before event start.
-- Keep a local copy/export path available before the event begins.
+- No automated test suite yet (`tests/`) — see `brain/teammate-tasks.md`.
+- No team-code generator script — same file.
+- `RUNBOOK.md` for whoever runs the admin panel live — not written yet.
