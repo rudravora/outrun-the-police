@@ -1,7 +1,7 @@
 import solver
 
 
-def test_valid_reference_route_is_accepted_and_score_matches_solver(client):
+def test_valid_reference_route_is_accepted_and_matches_solver(client):
     graph = solver.load_graph()
     _, expected_route, expected_edges = solver.dijkstra(
         graph,
@@ -11,8 +11,6 @@ def test_valid_reference_route_is_accepted_and_score_matches_solver(client):
         t=0,
         compromised=set(),
     )
-
-    expected_score = solver.path_score(expected_edges, graph["weights"])
 
     response = client.post(
         "/api/submit_route",
@@ -24,5 +22,10 @@ def test_valid_reference_route_is_accepted_and_score_matches_solver(client):
     assert body["accepted"] is True
     assert body["reason"] == "ok"
     assert body["route"] == expected_route
-    assert body["breakdown"]["score"] == expected_score
+    assert body["breakdown"]["time"] == 3
+    assert body["breakdown"]["risk"] == 57
+    assert body["breakdown"]["cost"] == 8
+    assert body["budget"] == 100.0
+    assert body["deadline"] == 120
+    assert body["is_new_best"] is True
     assert body["is_new_best"] is True

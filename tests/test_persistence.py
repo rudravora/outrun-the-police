@@ -131,8 +131,8 @@ def test_state_survives_real_server_restart(tmp_path):
         )
         assert status == 200
         assert submission["accepted"] is True
-        submitted_score = submission["breakdown"]["score"]
-        assert submitted_score == 235.0
+        submitted_risk = submission["breakdown"]["risk"]
+        assert submitted_risk == 57
 
         status, compromise = request_json(
             base_url,
@@ -156,7 +156,7 @@ def test_state_survives_real_server_restart(tmp_path):
         assert len(submissions) == 1
         assert submissions[0]["team_code"] == "PERSIST-TEAM"
         assert submissions[0]["valid"] == 1
-        assert submissions[0]["score"] == submitted_score
+        assert submissions[0]["score"] == submitted_risk
 
     finally:
         stop_server(first)
@@ -183,7 +183,15 @@ def test_state_survives_real_server_restart(tmp_path):
         )
         assert status == 200
         assert leaderboard == [
-            {"team_code": "PERSIST-TEAM", "best_score": submitted_score}
+            {
+                "team_code": "PERSIST-TEAM",
+                "risk": submitted_risk,
+                "time": 3,
+                "cost": 8,
+                "budget": 100.0,
+                "deadline": 120,
+                "has_valid_route": True,
+            }
         ]
 
         status, submissions = request_json(
@@ -196,7 +204,6 @@ def test_state_survives_real_server_restart(tmp_path):
         assert len(submissions) == 1
         assert submissions[0]["team_code"] == "PERSIST-TEAM"
         assert submissions[0]["valid"] == 1
-        assert submissions[0]["score"] == submitted_score
-
+        assert submissions[0]["score"] == submitted_risk
     finally:
         stop_server(second)
