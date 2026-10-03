@@ -3,3 +3,6 @@
 game/game.db
 __pycache__/
 *.pyc
+
+# Secrets — never commit these. See assets/CREDENTIALS.md (local only).
+assets/
