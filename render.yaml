@@ -3,24 +3,20 @@ services:
     name: outrun-the-police
     runtime: python
     plan: starter
-    buildCommand: pip install -r game/requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: cd game && gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 30
     envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: ADMIN_TOKEN
         sync: false
       - key: GATEWAY_BASE_URL
         sync: false
       - key: GATEWAY_API_KEY
         sync: false
-      - key: GATEWAY_DRAIN_INTERVAL
-        value: "15"
+      - key: GATEWAY_OPPORTUNISTIC_DRAIN_LIMIT
+        value: "3"
       - key: BUDGET_DEFAULT
         sync: false
       - key: INTEGRATION_KEYS
         sync: false
-      - key: DB_PATH
-        value: /data/game.db
-    disk:
-      name: outrun-data
-      mountPath: /data
-      sizeGB: 1
