@@ -74,8 +74,23 @@ import csv
 import io
 import json
 import os
+import sys
 import time
 from pathlib import Path
+
+# Make bare `import db`/`import gateway_client`/etc. below resolve regardless
+# of how this file is loaded. Render/Railway (`cd game && gunicorn app:app`)
+# and `python game/app.py` both already put game/ on sys.path as a side
+# effect of how they invoke it. Vercel's loader does not: it imports this
+# file directly via importlib's spec_from_file_location + exec_module,
+# which — unlike a normal `import game.app` — never executes game/__init__.py
+# first, so that file's identical sys.path fix never runs. Doing it here
+# instead means it's guaranteed regardless of entrypoint (2026-10-03, fixed
+# after this exact failure in production: "ModuleNotFoundError: No module
+# named 'db'" — see brain/logs.md).
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
 
 from flask import Flask, jsonify, request, Response, render_template, send_from_directory
 
