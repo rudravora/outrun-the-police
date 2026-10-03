@@ -1,3 +1,5 @@
+# Keep in sync with pyproject.toml's [project.dependencies] — Vercel reads
+# that (via uv), Render/Railway read this file (via pip).
 flask==3.1.3
 gunicorn==26.2.0
 psycopg2-binary==2.9.13
