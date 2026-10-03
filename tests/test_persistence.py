@@ -9,6 +9,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "game") not in sys.path:
+    sys.path.insert(0, str(ROOT / "game"))
+import db as _db  # noqa: E402 (after sys.path tweak, matches conftest.py's pattern)
+
 
 ADMIN_TOKEN = "persistence-test-token"
 ADMIN_HEADERS = {"X-Admin-Token": ADMIN_TOKEN}
@@ -101,9 +106,21 @@ def test_state_survives_real_server_restart(tmp_path):
     test_game = tmp_path / "game"
     shutil.copytree(source_game, test_game)
 
-    db_file = test_game / "game.db"
-    if db_file.exists():
-        db_file.unlink()
+    # Postgres migration: state now lives in DATABASE_URL, shared across
+    # test runs (there's no longer a per-test SQLite file to just not
+    # copy) — truncate before this test so "restart with a clean slate,
+    # then confirm exactly what we wrote survives" still holds.
+    if not _db.DATABASE_URL:
+        import pytest
+        pytest.skip("DATABASE_URL is not set — tests need a real Postgres (see DEPLOYMENT.md)")
+    _db.init_db()
+    _conn = _db.get_conn()
+    for _table in ("submissions", "teams", "compromised_nodes", "team_compromised_nodes",
+                   "gateway_outbox", "event_clock"):
+        _conn.execute(f"TRUNCATE TABLE {_table} RESTART IDENTITY CASCADE")
+    _conn.commit()
+    _conn.close()
+    _db.init_db()  # re-seed event_clock after the truncate
 
     port = free_port()
     base_url = f"http://127.0.0.1:{port}"
