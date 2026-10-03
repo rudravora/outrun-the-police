@@ -20,6 +20,9 @@ Admin (all require header X-Admin-Token matching ADMIN_TOKEN):
   GET  /api/admin/export          -> best valid route per team, JSON
   GET  /api/admin/export.csv      -> same, CSV
 
+Cron (gated by CRON_SECRET via `Authorization: Bearer <CRON_SECRET>`):
+  GET/POST /api/cron/drain-outbox -> once-daily backstop gateway-outbox retry
+
 Cross-game integration, LEGACY (all require header X-Game-Key, see
 integration_auth.py and brain/API-CONTRACT.md for the full contract) — left
 in place for any game still mid-switch, but SUPERSEDED by the real central
@@ -36,7 +39,12 @@ gateway-side compromised_nodes) via game/budget.py and inside
 /api/submit_route — see gateway_client.get_team_state(). Any gateway call
 that fails or times out (3s) falls back silently (budget -> BUDGET_DEFAULT,
 compromised_nodes -> skipped) and never blocks a submission; failed sends
-queue in the local gateway_outbox table and retry on a background thread.
+queue in the local gateway_outbox table (Postgres). Retried opportunistically
+on real request traffic (/api/submit_route, /api/leaderboard call
+gateway_client.drain_some() — a small bounded pass, since there's no
+background thread on serverless hosting), plus a once-daily
+/api/cron/drain-outbox backstop (gated on CRON_SECRET, meant for Vercel
+Cron — see vercel.json) for quiet periods with no real traffic.
 
 A node is blocked for a team's submission if it's in the global compromised
 list, that team's own admin/integration per-team list, OR the gateway's
@@ -171,8 +179,10 @@ def api_submit_route():
         return jsonify({"error": "route must be a list of node id strings"}), 400
 
     conn = db.get_conn()
+    gateway_client.drain_some()
     conn.execute(
-        "INSERT OR IGNORE INTO teams (team_code, name) VALUES (?, ?)", (team_code, team_code)
+        "INSERT INTO teams (team_code, name) VALUES (?, ?) ON CONFLICT (team_code) DO NOTHING",
+        (team_code, team_code),
     )
 
     t = db.current_event_t(conn)
@@ -262,7 +272,7 @@ def api_team_history(team_code):
     rows = conn.execute(
         """SELECT id, route_json, valid, reason, time_total, risk_total, cost_total,
                   score, submitted_at, event_t, route_code
-           FROM submissions WHERE team_code = ? ORDER BY submitted_at DESC""",
+           FROM submissions WHERE team_code = ? ORDER BY submitted_at DESC, id DESC""",
         (team_code,),
     ).fetchall()
     conn.close()
@@ -291,6 +301,7 @@ def api_leaderboard():
     err = require_admin()
     if err:
         return err
+    gateway_client.drain_some()
     conn = db.get_conn()
     team_codes = [r["team_code"] for r in conn.execute("SELECT team_code FROM teams").fetchall()]
     out = [_team_summary(conn, team_code) for team_code in team_codes]
@@ -314,7 +325,8 @@ def admin_compromise():
     conn = db.get_conn()
     if compromised:
         conn.execute(
-            "INSERT OR REPLACE INTO compromised_nodes (node_id, set_by, set_at) VALUES (?, ?, ?)",
+            "INSERT INTO compromised_nodes (node_id, set_by, set_at) VALUES (?, ?, ?) "
+            "ON CONFLICT (node_id) DO UPDATE SET set_by = EXCLUDED.set_by, set_at = EXCLUDED.set_at",
             (node_id, "admin", time.time()),
         )
     else:
@@ -346,8 +358,9 @@ def admin_team_compromise():
     conn = db.get_conn()
     if compromised:
         conn.execute(
-            "INSERT OR REPLACE INTO team_compromised_nodes (team_code, node_id, set_by, set_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO team_compromised_nodes (team_code, node_id, set_by, set_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (team_code, node_id) DO UPDATE SET "
+            "set_by = EXCLUDED.set_by, set_at = EXCLUDED.set_at",
             (team_code, node_id, "admin", time.time()),
         )
     else:
@@ -423,21 +436,22 @@ def admin_submissions():
         return err
     conn = db.get_conn()
     rows = conn.execute(
-        "SELECT * FROM submissions ORDER BY submitted_at DESC"
+        "SELECT * FROM submissions ORDER BY submitted_at DESC, id DESC"
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
 
 def _best_routes(conn):
+    # DISTINCT ON (Postgres-specific): one row per team_code, the
+    # lowest-score (best) row within each group — `id` breaks ties
+    # deterministically if two routes for the same team score identically.
     rows = conn.execute(
-        """SELECT s.team_code, s.route_json, s.time_total, s.risk_total, s.cost_total, s.score
-           FROM submissions s
-           JOIN (
-               SELECT team_code, MIN(score) AS best_score
-               FROM submissions WHERE valid = 1 GROUP BY team_code
-           ) b ON s.team_code = b.team_code AND s.score = b.best_score AND s.valid = 1
-           GROUP BY s.team_code"""
+        """SELECT DISTINCT ON (team_code) team_code, route_json, time_total, risk_total,
+                  cost_total, score
+           FROM submissions
+           WHERE valid = 1
+           ORDER BY team_code, score ASC, id ASC"""
     ).fetchall()
     return rows
 
@@ -489,7 +503,7 @@ def _best_row_for_team(conn, team_code):
     return conn.execute(
         """SELECT team_code, route_json, time_total, risk_total, cost_total, score
            FROM submissions WHERE team_code = ? AND valid = 1
-           ORDER BY score ASC LIMIT 1""",
+           ORDER BY score ASC, id ASC LIMIT 1""",
         (team_code,),
     ).fetchone()
 
@@ -548,6 +562,27 @@ def integration_result(team_code):
     })
 
 
+@app.route("/api/cron/drain-outbox", methods=["GET", "POST"])
+def cron_drain_outbox():
+    """
+    Daily backstop for the gateway outbox, meant to be hit by Vercel Cron
+    (see vercel.json) — opportunistic draining on real request traffic
+    (gateway_client.drain_some(), called from /api/submit_route and
+    /api/leaderboard) handles the normal case, this just guarantees
+    something eventually retries queued events even during a quiet period
+    with no real traffic. Gated by CRON_SECRET: Vercel auto-sends it as
+    `Authorization: Bearer <CRON_SECRET>` on cron-triggered requests when
+    CRON_SECRET is set as a project env var (see
+    https://vercel.com/docs/cron-jobs/manage-cron-jobs#securing-cron-jobs).
+    """
+    cron_secret = os.environ.get("CRON_SECRET")
+    auth = request.headers.get("Authorization", "")
+    if not cron_secret or auth != f"Bearer {cron_secret}":
+        return jsonify({"error": "unauthorized"}), 401
+    delivered, remaining = gateway_client.drain_outbox_once()
+    return jsonify({"delivered": delivered, "remaining": remaining})
+
+
 @app.route("/api/integration/compromise-trigger", methods=["POST"])
 def integration_compromise_trigger():
     """Cross-game write: another game (e.g. Game 3) reports a team's node as
@@ -569,8 +604,9 @@ def integration_compromise_trigger():
 
     conn = db.get_conn()
     conn.execute(
-        "INSERT OR REPLACE INTO team_compromised_nodes (team_code, node_id, set_by, set_at) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO team_compromised_nodes (team_code, node_id, set_by, set_at) "
+        "VALUES (?, ?, ?, ?) ON CONFLICT (team_code, node_id) DO UPDATE SET "
+        "set_by = EXCLUDED.set_by, set_at = EXCLUDED.set_at",
         (team_code, node_id, f"integration:{request.game_name}:{reason}"[:200], time.time()),
     )
     conn.commit()
@@ -578,17 +614,15 @@ def integration_compromise_trigger():
     return jsonify({"team_code": team_code, "node_id": node_id, "compromised": True})
 
 
-# Runs at import time too (not just under `python app.py`), so this also
-# fires correctly under a production WSGI server (gunicorn imports this
-# module and never executes the __main__ block below).
+# Runs at import time (not just under `python app.py`), so this also fires
+# correctly under gunicorn (Render/Railway) and under Vercel's serverless
+# import — neither one ever executes the __main__ block below. There's no
+# background drain thread anymore (serverless function instances aren't
+# alive between requests) — see gateway_client.py: outbox draining now
+# happens opportunistically on real traffic (drain_some(), called from
+# /api/submit_route and /api/leaderboard above) plus the daily
+# /api/cron/drain-outbox backstop.
 db.init_db()
-if os.environ.get("WERKZEUG_RUN_MAIN") != "false":
-    # Under Flask's debug reloader, the parent process re-execs with
-    # WERKZEUG_RUN_MAIN unset and the child sets it to "true" — only the
-    # actual worker (child, or gunicorn's single import) starts the thread,
-    # never the reloader's parent, so it's never started twice.
-    if os.environ.get("FLASK_DEBUG") != "1" or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        gateway_client.start_drain_thread()
 
 if __name__ == "__main__":
     # Local dev entrypoint. Production (Render/Railway) runs this module
