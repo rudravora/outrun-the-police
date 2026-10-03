@@ -2,6 +2,7 @@
 Flask backend for "Outrun the Police" (CODEVERSE 2.0, Phase 2 Game 4).
 
 Team-facing:
+  GET  /                             -> redirects to /team
   GET  /team                        -> team app UI (graph view, submission form, history)
   GET  /api/graph                   -> graph filtered by live clock + compromised nodes
   GET  /api/graph.json              -> raw generated graph.json (static download)
@@ -92,7 +93,7 @@ _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
 
-from flask import Flask, jsonify, request, Response, render_template, send_from_directory
+from flask import Flask, jsonify, request, Response, redirect, render_template, send_from_directory
 
 import db
 import gateway_client
@@ -139,6 +140,14 @@ def visible_graph(t, compromised):
         "event_duration": GRAPH["event_duration"],  # also the submission deadline (total time cap)
         "compromised_nodes": sorted(compromised),
     }
+
+
+@app.route("/", methods=["GET"])
+def index():
+    """No dedicated landing page — / redirects to the team app, the actual
+    default entrypoint teams use. (There was previously no route at all for
+    /, which 404'd — /admin and /team were the only pages registered.)"""
+    return redirect("/team")
 
 
 @app.route("/admin", methods=["GET"])
