@@ -16,7 +16,220 @@ Format per entry:
 
 ---
 
-## 2026-10-02 (Claude Code — real central gateway integration)
+## 2026-10-03 (Claude Code — migrate SQLite+Render to Postgres+Vercel)
+- **New scope, confirmed by Rudra**: finish migrating the whole `game/`
+  backend off SQLite onto Postgres (Supabase), and add Vercel as a
+  supported deploy target alongside Render/Railway (not replacing them —
+  both paths stay live). Read `DEPLOYMENT.md`'s "Why not Vercel" section
+  first per the instruction — that section's own reasoning (no persistent
+  disk, no background thread on serverless) is exactly what this session
+  fixes; that section no longer exists in the doc, replaced by a real
+  "Vercel + Supabase" how-to (see below).
+- **`game/db.py`**: full rewrite, sqlite3 -> psycopg2. Every function
+  signature and every caller's `row["col"]` access stayed unchanged — the
+  actual trick is a small `Conn` wrapper class around the raw psycopg2
+  connection/cursor (`psycopg2.extras.RealDictCursor`) that makes
+  `conn.execute(sql, params)` keep working (psycopg2 connections don't
+  have `.execute()` natively, only cursors do) and translates this
+  codebase's `?` placeholders to psycopg2's `%s` — confirmed safe to do
+  with a blind string replace by grepping every SQL string in the repo
+  for a literal `?` inside a value/string literal first (none exist, all
+  `?` occurrences are genuine placeholders). `AUTOINCREMENT` -> `SERIAL`,
+  dropped the SQLite-only `PRAGMA foreign_keys` line. New
+  `gateway_outbox` table unchanged structurally, but `outbox_pending()`
+  gained an optional `limit` param (an SQL `LIMIT` clause) — needed for
+  bounded opportunistic draining, see gateway_client.py below.
+  `DATABASE_URL` is now the only way this app gets a database; `get_conn()`
+  raises immediately with a clear message if it's unset, rather than
+  falling back to anything — confirmed this fails loudly and correctly
+  (tested: running `app.py` with no `DATABASE_URL` set raises before
+  serving a single request).
+- **`game/app.py`**: every SQLite-only `INSERT OR IGNORE`/`INSERT OR
+  REPLACE` rewritten to Postgres `ON CONFLICT ... DO NOTHING` / `DO
+  UPDATE SET ... EXCLUDED...` at all 4 call sites (teams by `team_code`;
+  `compromised_nodes` by `node_id`; `team_compromised_nodes` from both
+  `/api/admin/team_compromise` and `/api/integration/compromise-trigger`,
+  both by `(team_code, node_id)`). Added `gateway_client.drain_some()` at
+  the top of `/api/submit_route` and `/api/leaderboard` — opportunistic
+  outbox draining riding real traffic on the two highest-traffic
+  endpoints, since there's no background thread anymore. New
+  `GET/POST /api/cron/drain-outbox`, gated on `CRON_SECRET` checked
+  against `Authorization: Bearer <CRON_SECRET>` (the header Vercel's
+  cron jobs auto-send — confirmed from
+  https://vercel.com/docs/cron-jobs/manage-cron-jobs#securing-cron-jobs),
+  calls `drain_outbox_once()` with no limit (drains everything) as a
+  once-daily backstop for quiet periods with no real traffic to
+  opportunistically drain on. `db.init_db()` was **already** running at
+  plain module-import time from an earlier session (the Render/Railway
+  deployment work, see the 2026-10-02 `aa82300` commit) — not something
+  this session had to add, just confirmed it's still correct for Vercel's
+  import-based invocation too.
+- **Found and fixed two real Postgres-portability bugs** while running
+  the actual test suite (not caught by eyeballing the SQL, only by
+  actually running it against real Postgres — see testing below):
+  1. `ORDER BY submitted_at DESC` with no tiebreaker: SQLite's B-tree scan
+     happened to return ties in insertion order; Postgres gives **no**
+     ordering guarantee on ties at all. Two submissions landing in the
+     same wall-clock instant (easily happens in fast test runs, or two
+     people submitting near-simultaneously at a live event) came back in
+     unpredictable order, breaking "newest first" semantics. Fixed by
+     adding `, id DESC` as an explicit secondary sort key everywhere this
+     query appears (`/api/team/<code>/history`, `/api/admin/submissions`)
+     — `id` is a `SERIAL`, so it's a true, monotonic insertion-order
+     tiebreaker.
+  2. `_best_routes()` (used by `/api/admin/export` and `.csv`) had an
+     outer `GROUP BY s.team_code` selecting non-aggregated, non-grouped
+     columns (`route_json`, `time_total`, etc.) — SQLite silently allows
+     this and picks an arbitrary row per group; Postgres enforces
+     standard SQL and rejects the query outright
+     (`psycopg2.errors.GroupingError`). Rewrote using Postgres'
+     `DISTINCT ON (team_code)` with `ORDER BY team_code, score ASC, id
+     ASC` — one row per team, deterministically the lowest-score (best)
+     row, `id` breaking any exact-score ties. Not a behavior change from
+     what was *intended* (best route per team), just making it correct
+     and deterministic instead of "worked by SQLite accident."
+- **`game/gateway_client.py`**: removed `start_drain_thread()` and all
+  `threading` code — a serverless function instance isn't alive between
+  requests, so a thread sleeping between retries would simply never run
+  there (this was flagged as the core incompatibility in
+  `DEPLOYMENT.md`'s old "Why not Vercel" section). Kept
+  `drain_outbox_once()`, now accepting an optional `limit` (passed through
+  to `db.outbox_pending(limit=...)`). Added `drain_some()`: a thin
+  never-raising wrapper calling `drain_outbox_once(limit=
+  GATEWAY_OPPORTUNISTIC_DRAIN_LIMIT)` (env var, default 3) — this is what
+  `/api/submit_route`/`/api/leaderboard` call.
+- **Vercel entrypoint**: per Vercel's current Flask docs (fetched
+  2026-10-02, per the instruction) — a `[tool.vercel] entrypoint =
+  "game.app:app"` in a root `pyproject.toml`, no old-style
+  `api/index.py` WSGI-wrapper pattern needed. Hit a real problem doing
+  this: `game/app.py` and its sibling modules (`db.py`, `budget.py`,
+  etc.) import each other with bare names (`import db`, not `from . import
+  db`), which only resolves when `game/`'s directory is directly on
+  `sys.path` — true for `cd game && gunicorn app:app` and `python
+  game/app.py` (Render/Railway/local dev, unchanged), **not** true when
+  something imports `game.app` as a package submodule (confirmed by
+  reproducing the exact `ModuleNotFoundError: No module named 'db'`
+  before fixing it). Fixed with a new `game/__init__.py` that inserts its
+  own directory onto `sys.path` at import time — makes `import game.app`
+  work without changing a single import statement inside `game/`'s own
+  modules, so the Render/Railway/local-dev entrypoints stay exactly as
+  they were.
+- **Dependencies**: `requirements.txt` (repo root — what Vercel's Python
+  builder reads) gained `psycopg2-binary==2.9.13`, kept `flask`/`gunicorn`
+  (gunicorn still needed for Render/Railway, which stays supported in
+  parallel — not a replacement). `game/requirements.txt` deleted (nothing
+  references it anymore — confirmed via grep before deleting). Updated
+  `render.yaml`'s `buildCommand` to point at the root file, and while in
+  there, removed the now-dead `DB_PATH`/persistent-disk block entirely
+  (SQLite is gone, so that config was actively wrong, not just stale —
+  fixed as the direct, necessary consequence of this migration, not scope
+  creep) and switched Render's plan recommendation from paid `starter`
+  back to `free`, since the whole reason for recommending the paid tier
+  (no persistent disk on free = SQLite resets on every redeploy) no
+  longer applies once state lives in Postgres. `deploy/start.sh`
+  (confirmed unreferenced by `render.yaml`/`Procfile` via grep) had its
+  SQLite-symlink setup removed since it's now actively wrong, left as an
+  alternate manual-start script.
+- **`vercel.json`**: registers `/api/cron/drain-outbox` on `0 3 * * *`
+  (once daily — confirmed from Vercel's docs that Hobby/free plan only
+  allows once-per-day cron, so this is already the right granularity, not
+  a placeholder to tighten later).
+- **`DEPLOYMENT.md`**: added a full "Vercel + Supabase" section
+  (Supabase pooler-string setup, Vercel project env vars, confirming the
+  auto-detected entrypoint, the cron registration). Kept Render/Railway
+  as fully-supported parallel options per the instruction, but fixed
+  their SQLite-era content (disk/`DB_PATH` steps, the "why not Vercel"
+  framing that's now backwards) since leaving it would actively mislead
+  anyone following the doc. Removed the stale "What's still not covered"
+  footer (referenced a test suite and runbook that both now exist, from
+  the 2026-10-02 `e2048de` commit) in favor of a short "Local
+  development" pointer to `DATABASE_URL` being required everywhere now.
+- **Found and fixed a second-order breakage while testing**: the existing
+  `tests/` suite (from the 2026-10-02 teammate commit) got its per-test
+  isolation from SQLite specifically — `conftest.py`'s `client` fixture
+  monkeypatched `db.DB_PATH` to a fresh `tmp_path` file per test, and
+  `test_persistence.py`'s real-subprocess restart test deleted a fresh
+  copy's `game.db` before starting. Both assumptions are gone post-
+  migration (there's no `DB_PATH` anymore, and every test now shares one
+  real `DATABASE_URL` database). Fixed both fixtures to `TRUNCATE` every
+  table before running instead, which restores the same "each test starts
+  from a known-empty state" guarantee against a shared Postgres instance.
+  This wasn't in the explicit instruction list, but leaving the test
+  suite silently broken by a migration this session caused would be
+  exactly the kind of root-cause-not-symptom gap worth catching rather
+  than shipping around.
+- **Tested against a real Supabase Postgres** (user-provided pooler
+  connection string, port 6543, used only as a local env var this
+  session — never written into any file or commit):
+  - `python game/db.py` -> `init_db()` ran cleanly; confirmed all 6
+    tables exist with correct shape via
+    `information_schema.tables`/direct `SELECT *` on `event_clock`
+    (correctly seeded `t=0, running=0`).
+  - Ran the real Flask app (`FLASK_DEBUG=1`) against that `DATABASE_URL`:
+    `/api/graph` returned correctly; submitted a route -> accepted,
+    correct breakdown, correct deterministic `route_code`
+    (`AA33-FB43`, matching the exact value from the 2026-10-02 gateway
+    session's unit-level test of the same inputs — confirms the
+    migration didn't change route-code computation at all); confirmed via
+    a direct `SELECT` that the `teams`/`submissions` rows genuinely
+    persisted in Postgres, not just returned in the response.
+  - `/api/admin/compromise` toggle -> `/api/graph` immediately reflected
+    it; re-toggling the same node true-then-true exercised the `ON
+    CONFLICT DO UPDATE` path with no duplicate-key error; same for
+    `/api/admin/team_compromise`.
+  - `/api/cron/drain-outbox`: no `Authorization` header -> 401; wrong
+    bearer token -> 401; correct token -> 200. With no gateway configured,
+    correctly reported `delivered: 0` and an accurate `remaining` count
+    without attempting any send (confirmed via the outbox table directly:
+    `attempts` stayed 0, proving it genuinely skipped delivery rather than
+    silently failing one).
+  - Opportunistic draining: pointed `GATEWAY_BASE_URL` at
+    `game/gateway_mock.py` (from the 2026-10-02 session), hit
+    `/api/leaderboard` — both stale queued outbox events (originally
+    queued earlier in this same test session while no gateway was
+    configured) were delivered with their *original* `event_id`s, exact
+    correct `solved`/`output_issued` payloads, confirmed via the mock's
+    `/mock/events` plus a direct outbox-table check showing both rows
+    flipped to `delivered=1`. This is the full real-traffic-drains-the-
+    queue path working end-to-end, not just read from the code.
+  - Re-ran `solver.py`'s self-check — unchanged output, confirms this
+    migration never touched scoring/validation logic (it wasn't supposed
+    to, and didn't).
+  - Ran the **real `tests/` suite** against the same live Postgres (after
+    fixing the two fixture files above): all 24 tests pass, including
+    `test_gateway.py`'s full gateway-client coverage and
+    `test_persistence.py`'s real-subprocess restart test (which now
+    genuinely proves state survives a process restart against Postgres,
+    the actual thing that test exists to prove). This caught both the
+    `ORDER BY` tiebreak bug and the `GROUP BY` portability bug above —
+    neither was visible from reading the code, only from actually running
+    it against real Postgres.
+  - Cleaned up: truncated all tables in the shared Supabase instance
+    after testing (no leftover `TEAM1`/`PERSIST-TEAM`/etc. test rows),
+    killed local test servers.
+- **What's still open / left for next session**:
+  - **The actual Vercel deployment step (instruction 8's last bullet)
+    was NOT done this session** — `vercel link`/`vercel deploy` needs
+    Vercel account authentication and picking/confirming a real project,
+    which is account-specific setup only Rudra can complete. Everything
+    up to that point (entrypoint config, env var list, cron registration)
+    is built and locally verified against real Postgres; the deploy
+    itself and the "confirm the deployed URL's /admin and /team work
+    end-to-end against live Supabase" check are the one remaining step.
+    See `DEPLOYMENT.md`'s "Option 0 — Vercel + Supabase" section for the
+    exact steps.
+  - Nothing else known-broken from what was tested.
+  - `CRON_SECRET` has no default/fallback (unlike `ADMIN_TOKEN`'s
+    `dev-admin-token`) — correct on purpose (a guessable cron secret
+    would let anyone trigger outbox drains), but means the cron endpoint
+    is simply unreachable (always 401) until it's deliberately set in
+    Vercel's project settings.
+  - Render's `render.yaml` plan recommendation changed from `starter` to
+    `free` in this session (see above) — worth Rudra's explicit okay
+    before relying on Render's free tier for the actual event if Render
+    ends up the chosen host, free-tier cold-starts/spin-down behavior
+    (separate from the old disk-wipe issue, which is genuinely fixed) is
+    still worth a real test before event day regardless of host.
 - **New scope, confirmed by Rudra**: implement the actual CODEVERSE 2.0
   central gateway integration per `brain/GATEWAY-INTEGRATION-SPEC.md`
   (saved verbatim — Rudra pasted it after an initial request referenced it
