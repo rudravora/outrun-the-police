@@ -16,12 +16,19 @@ That keeps local dev/testing working exactly as before this integration.
 team_id: our existing team_code is used as-is (confirmed with the gateway
 owner — no mapping table needed, unlike the spec's T01/T07/T00 examples).
 game_id: "p2g4" (us, per spec §2).
+
+Outbox draining: no background thread (removed in the Vercel/Postgres
+migration — a serverless function instance isn't alive between requests,
+so a thread sleeping between retries never actually runs). Instead:
+drain_some() does a small bounded retry pass, called from high-traffic
+endpoints (app.py's /api/submit_route, /api/leaderboard) so queued events
+get retried on real traffic; drain_outbox_once() with no limit drains
+everything, called once a day by GET/POST /api/cron/drain-outbox (meant
+for Vercel Cron, see vercel.json) as a backstop for quiet periods.
 """
 import json
 import logging
 import os
-import threading
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -33,7 +40,11 @@ GATEWAY_BASE_URL = os.environ.get("GATEWAY_BASE_URL", "").rstrip("/")
 GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "")
 GAME_ID = "p2g4"
 TIMEOUT_SECONDS = 3
-DRAIN_INTERVAL_SECONDS = float(os.environ.get("GATEWAY_DRAIN_INTERVAL", "15"))  # spec: 10-30s
+
+# No background thread on serverless hosting (a function instance isn't
+# alive between requests) — outbox draining instead rides real traffic via
+# drain_some(), a small bounded pass called from high-traffic endpoints.
+OPPORTUNISTIC_DRAIN_LIMIT = int(os.environ.get("GATEWAY_OPPORTUNISTIC_DRAIN_LIMIT", "3"))
 
 # Spec §5: "ONE event for EACH wrong submission" — ambiguous for us (unlike
 # p2g1/p2g3 where the spec explicitly calls it out), so this ships off.
@@ -136,14 +147,18 @@ def get_team_state(team_id):
         return None
 
 
-def drain_outbox_once():
-    """One retry pass over queued outbox events. Returns (delivered_count,
-    remaining_count). Safe to call even when not configured (returns
-    immediately — nothing to deliver to)."""
+def drain_outbox_once(limit=None):
+    """
+    One retry pass over queued outbox events. `limit` bounds how many rows
+    are attempted (None = drain everything — used by the daily cron
+    backstop). Returns (delivered_count, remaining_count). Safe to call
+    even when not configured (returns immediately — nothing to deliver to).
+    Never raises.
+    """
     if not _configured():
-        return 0, len(db.outbox_pending())
+        return 0, len(db.outbox_pending(limit=limit))
 
-    pending = db.outbox_pending()
+    pending = db.outbox_pending(limit=limit)
     delivered = 0
     for row in pending:
         body = json.loads(row["body_json"])
@@ -157,19 +172,15 @@ def drain_outbox_once():
     return delivered, len(pending) - delivered
 
 
-def start_drain_thread():
-    """Starts a simple daemon thread that retries the outbox every
-    DRAIN_INTERVAL_SECONDS (spec: 10-30s). Intentionally simple — one
-    thread, no pooling/backoff — this is a one-event-every-few-seconds
-    workload, not a high-throughput queue."""
-    def loop():
-        while True:
-            time.sleep(DRAIN_INTERVAL_SECONDS)
-            try:
-                drain_outbox_once()
-            except Exception as e:
-                log.warning("gateway drain loop error: %s", e)
-
-    t = threading.Thread(target=loop, name="gateway-outbox-drain", daemon=True)
-    t.start()
-    return t
+def drain_some():
+    """
+    Opportunistic draining: a small bounded retry pass
+    (OPPORTUNISTIC_DRAIN_LIMIT, default 3), meant to be called from
+    high-traffic endpoints (/api/submit_route, /api/leaderboard) so the
+    outbox gets retried on real traffic without a background thread. Never
+    raises — any failure here must not break the request that triggered it.
+    """
+    try:
+        drain_outbox_once(limit=OPPORTUNISTIC_DRAIN_LIMIT)
+    except Exception as e:
+        log.warning("gateway drain_some error: %s", e)
