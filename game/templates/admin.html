@@ -76,10 +76,13 @@
     <h2>Compromised Nodes (Per-Team — this team only)</h2>
     <p class="hint">Amber = per-team, not global. Blocks only the listed team's submissions. Also set live by other games via the integration API (see API-CONTRACT.md).</p>
     <div class="row">
-      <input id="team-compromise-team" placeholder="team code">
-      <input id="team-compromise-node" placeholder="node id, e.g. N15">
+      <input id="team-compromise-team" placeholder="team code" oninput="loadTeamNodeGrid()">
+      <input id="team-compromise-node" placeholder="node ids, e.g. N52, N11">
       <button class="primary" onclick="addTeamCompromise()">Compromise for this team</button>
+      <button class="danger" onclick="clearAllForTeam()">Clear all for this team</button>
     </div>
+    <div id="team-compromise-error" class="bad"></div>
+    <div id="team-node-grid"></div>
     <div id="team-compromise-list"></div>
   </section>
 
@@ -196,40 +199,115 @@ function toggleNode(nodeId, compromised) {
   }).then(r => r.json()).then(() => loadGraphForNodes());
 }
 
+let ALL_TEAM_COMPROMISED = [];
+
 function loadTeamCompromised() {
-  authedFetch('/api/admin/team_compromised').then(r => r.json()).then(rows => {
+  return authedFetch('/api/admin/team_compromised').then(r => r.json()).then(rows => {
+    ALL_TEAM_COMPROMISED = rows;
     const el = document.getElementById('team-compromise-list');
     el.innerHTML = '';
     if (rows.length === 0) {
       el.innerHTML = '<span class="muted">No per-team compromises active.</span>';
-      return;
+    } else {
+      const byTeam = {};
+      rows.forEach(row => {
+        (byTeam[row.team_code] = byTeam[row.team_code] || []).push(row.node_id);
+      });
+      Object.keys(byTeam).sort().forEach(team_code => {
+        const div = document.createElement('div');
+        div.style.marginBottom = '4px';
+        const nodes = byTeam[team_code].sort().map(node_id =>
+          `<span class="team-chip">${node_id} <button onclick="removeTeamCompromise('${team_code}','${node_id}')">clear</button></span>`
+        ).join('');
+        div.innerHTML = `<strong>${team_code}:</strong> ${nodes}`;
+        el.appendChild(div);
+      });
     }
-    rows.forEach(row => {
-      const chip = document.createElement('span');
-      chip.className = 'team-chip';
-      chip.innerHTML = `${row.team_code}: ${row.node_id} <button onclick="removeTeamCompromise('${row.team_code}','${row.node_id}')">clear</button>`;
-      el.appendChild(chip);
-    });
+    loadTeamNodeGrid();
+  });
+}
+
+function parseNodeIds(raw) {
+  const seen = new Set();
+  return raw.split(/[,;\s]+/).map(s => s.trim().toUpperCase()).filter(s => {
+    if (!s || seen.has(s)) return false;
+    seen.add(s);
+    return true;
   });
 }
 
 function addTeamCompromise() {
   const team_code = document.getElementById('team-compromise-team').value.trim();
-  const node_id = document.getElementById('team-compromise-node').value.trim();
-  if (!team_code || !node_id) return;
+  const node_ids = parseNodeIds(document.getElementById('team-compromise-node').value);
+  const errEl = document.getElementById('team-compromise-error');
+  errEl.textContent = '';
+  if (!team_code || node_ids.length === 0) return;
   authedFetch('/api/admin/team_compromise', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ team_code, node_id, compromised: true })
-  }).then(r => r.json()).then(() => loadTeamCompromised());
+    body: JSON.stringify({ team_code, node_ids, compromised: true })
+  }).then(async r => {
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'request failed');
+    document.getElementById('team-compromise-node').value = '';
+    loadTeamCompromised();
+  }).catch(e => {
+    errEl.textContent = e.message;
+  });
+}
+
+function toggleTeamNode(team_code, node_id, compromised) {
+  const errEl = document.getElementById('team-compromise-error');
+  errEl.textContent = '';
+  authedFetch('/api/admin/team_compromise', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ team_code, node_id, compromised })
+  }).then(async r => {
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'request failed');
+    loadTeamCompromised();
+  }).catch(e => {
+    errEl.textContent = e.message;
+  });
 }
 
 function removeTeamCompromise(team_code, node_id) {
+  toggleTeamNode(team_code, node_id, false);
+}
+
+function clearAllForTeam() {
+  const team_code = document.getElementById('team-compromise-team').value.trim();
+  if (!team_code) return;
+  const nodes = ALL_TEAM_COMPROMISED.filter(r => r.team_code === team_code).map(r => r.node_id);
+  if (nodes.length === 0) return;
   authedFetch('/api/admin/team_compromise', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ team_code, node_id, compromised: false })
+    body: JSON.stringify({ team_code, node_ids: nodes, compromised: false })
   }).then(r => r.json()).then(() => loadTeamCompromised());
+}
+
+function loadTeamNodeGrid() {
+  const team_code = document.getElementById('team-compromise-team').value.trim();
+  const grid = document.getElementById('team-node-grid');
+  if (!team_code) {
+    grid.innerHTML = '';
+    return;
+  }
+  const compromisedSet = new Set(
+    ALL_TEAM_COMPROMISED.filter(r => r.team_code === team_code).map(r => r.node_id)
+  );
+  fetch('/api/graph').then(r => r.json()).then(g => {
+    grid.innerHTML = '';
+    g.nodes.forEach(n => {
+      const chip = document.createElement('span');
+      chip.className = 'node-chip' + (compromisedSet.has(n.id) ? ' compromised' : '');
+      chip.textContent = n.id;
+      chip.onclick = () => toggleTeamNode(team_code, n.id, !compromisedSet.has(n.id));
+      grid.appendChild(chip);
+    });
+  });
 }
 
 function loadLeaderboard() {

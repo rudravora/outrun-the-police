@@ -14,7 +14,7 @@ Team-facing:
 Admin (all require header X-Admin-Token matching ADMIN_TOKEN):
   GET  /admin                     -> admin panel UI (token entered client-side)
   POST /api/admin/compromise      -> {node_id, compromised: bool} (GLOBAL, all teams)
-  POST /api/admin/team_compromise -> {team_code, node_id, compromised: bool} (this team only)
+  POST /api/admin/team_compromise -> {team_code, node_id|node_ids, compromised: bool} (this team only)
   GET  /api/admin/team_compromised -> full list of active per-team compromises
   POST /api/admin/clock           -> {action: start|pause|set, t: optional}
   GET  /api/admin/submissions     -> full submission log (valid + rejected)
@@ -376,37 +376,56 @@ def admin_compromise():
 def admin_team_compromise():
     """Per-team compromise layer — additive to the global list above, does
     not replace it. A node is blocked for a team if it's in EITHER list
-    (see db.effective_compromised)."""
+    (see db.effective_compromised). Accepts either a single node_id (legacy)
+    or a node_ids list; either way every id is validated before any write."""
     err = require_admin()
     if err:
         return err
     body = request.get_json(silent=True) or {}
     team_code = body.get("team_code")
-    node_id = body.get("node_id")
     compromised = body.get("compromised", True)
+    if "node_ids" in body:
+        node_ids = body.get("node_ids")
+        if not isinstance(node_ids, list) or not node_ids:
+            return jsonify({"error": "node_ids must be a non-empty list"}), 400
+    else:
+        node_ids = [body.get("node_id")]
+
     valid_ids = {n["id"] for n in GRAPH["nodes"]}
     if not team_code or not isinstance(team_code, str):
         return jsonify({"error": "team_code is required"}), 400
-    if node_id not in valid_ids:
-        return jsonify({"error": f"unknown node {node_id}"}), 400
+    invalid = [n for n in node_ids if n not in valid_ids]
+    if invalid:
+        return jsonify({"error": f"unknown node(s): {', '.join(invalid)}"}), 400
 
     conn = db.get_conn()
-    if compromised:
-        conn.execute(
-            "INSERT INTO team_compromised_nodes (team_code, node_id, set_by, set_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT (team_code, node_id) DO UPDATE SET "
-            "set_by = EXCLUDED.set_by, set_at = EXCLUDED.set_at",
-            (team_code, node_id, "admin", time.time()),
-        )
-    else:
-        conn.execute(
-            "DELETE FROM team_compromised_nodes WHERE team_code = ? AND node_id = ?",
-            (team_code, node_id),
-        )
+    for node_id in node_ids:
+        if compromised:
+            conn.execute(
+                "INSERT INTO team_compromised_nodes (team_code, node_id, set_by, set_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (team_code, node_id) DO UPDATE SET "
+                "set_by = EXCLUDED.set_by, set_at = EXCLUDED.set_at",
+                (team_code, node_id, "admin", time.time()),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM team_compromised_nodes WHERE team_code = ? AND node_id = ?",
+                (team_code, node_id),
+            )
     conn.commit()
-    now_compromised = node_id in db.get_team_compromised(team_code, conn)
+    now_compromised_set = db.get_team_compromised(team_code, conn)
     conn.close()
-    return jsonify({"team_code": team_code, "node_id": node_id, "compromised": now_compromised})
+    if "node_ids" in body:
+        return jsonify({
+            "team_code": team_code,
+            "node_ids": node_ids,
+            "compromised": compromised,
+        })
+    return jsonify({
+        "team_code": team_code,
+        "node_id": node_ids[0],
+        "compromised": node_ids[0] in now_compromised_set,
+    })
 
 
 @app.route("/api/admin/team_compromised", methods=["GET"])

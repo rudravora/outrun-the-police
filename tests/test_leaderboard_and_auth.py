@@ -106,3 +106,50 @@ def test_admin_endpoint_accepts_valid_token(client):
 
     assert response.status_code == 200
     assert response.get_json() == []
+
+
+def test_team_compromise_accepts_node_id_list(client):
+    response = client.post(
+        "/api/admin/team_compromise",
+        headers=ADMIN_HEADERS,
+        json={"team_code": "TEAM01", "node_ids": ["N52", "N11"], "compromised": True},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "team_code": "TEAM01",
+        "node_ids": ["N52", "N11"],
+        "compromised": True,
+    }
+
+    rows = client.get("/api/admin/team_compromised", headers=ADMIN_HEADERS).get_json()
+    assert {r["node_id"] for r in rows if r["team_code"] == "TEAM01"} == {"N52", "N11"}
+
+
+def test_team_compromise_list_rejects_any_bad_id_and_applies_none(client):
+    response = client.post(
+        "/api/admin/team_compromise",
+        headers=ADMIN_HEADERS,
+        json={"team_code": "TEAM01", "node_ids": ["N52", "N999"], "compromised": True},
+    )
+
+    assert response.status_code == 400
+    assert "N999" in response.get_json()["error"]
+
+    rows = client.get("/api/admin/team_compromised", headers=ADMIN_HEADERS).get_json()
+    assert rows == []
+
+
+def test_team_compromise_single_node_id_still_works(client):
+    response = client.post(
+        "/api/admin/team_compromise",
+        headers=ADMIN_HEADERS,
+        json={"team_code": "TEAM01", "node_id": "N52", "compromised": True},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "team_code": "TEAM01",
+        "node_id": "N52",
+        "compromised": True,
+    }
