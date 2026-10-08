@@ -184,11 +184,22 @@ def api_graph_csv_download():
 
 @app.route("/api/graph", methods=["GET"])
 def api_graph():
+    team_code = request.args.get("team_code")
     conn = db.get_conn()
     t = db.current_event_t(conn)
-    compromised = db.get_compromised(conn)
+    if team_code:
+        compromised = db.effective_compromised(team_code, conn)
+        gw_state = gateway_client.get_team_state(team_code)
+        if gw_state is not None and gw_state.get("compromised_nodes"):
+            compromised = compromised | {str(n) for n in gw_state["compromised_nodes"]}
+    else:
+        compromised = db.get_compromised(conn)
     conn.close()
-    return jsonify(visible_graph(t, compromised))
+    resp = jsonify(visible_graph(t, compromised))
+    if team_code:
+        # Per-team view must never be cached/shared across teams.
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/api/submit_route", methods=["POST"])

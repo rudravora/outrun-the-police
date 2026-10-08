@@ -418,7 +418,8 @@ function formatClock(t) {
 
 async function loadGraph() {
   try {
-    const res = await fetch('/api/graph');
+    const url = TEAM_CODE ? `/api/graph?team_code=${encodeURIComponent(TEAM_CODE)}` : '/api/graph';
+    const res = await fetch(url);
     if (!res.ok) throw new Error('graph fetch failed: ' + res.status);
     const g = await res.json();
     LATEST_GRAPH = g;
